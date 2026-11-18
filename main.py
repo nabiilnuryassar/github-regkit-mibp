@@ -8,14 +8,17 @@ import sys
 from pathlib import Path
 
 from github_register.config import load_config
+from github_register.dotenv import load_dotenv
 from github_register.runner import run_job, silence_playwright_noise
 
 
 def main() -> int:
+    load_dotenv()  # .env first: engine credentials (CLOAKBROWSER_LICENSE_KEY, ...)
     silence_playwright_noise()  # hide TargetClosedError spam on browser exit
     ap = argparse.ArgumentParser(
         prog="github-regkit",
-        description="Auto-register GitHub accounts (Camoufox + Litensi mail).",
+        description="Auto-register GitHub accounts (multi-engine: Camoufox / Patchright / "
+        "CloakBrowser / ... with automatic fallback; mail.cx or Litensi mail).",
     )
     ap.add_argument("--config", default="config.json", help="path to config json")
     ap.add_argument("--count", type=int, default=None, help="override register_count")

@@ -64,3 +64,22 @@ regkit_codebuddy.*
 *.tmp
 .DS_Store
 proxies.txt*
+
+# === CodeBuddy login module (vendored Node flow; sensitive local files) ===
+codebuddy_login/node_modules/
+codebuddy_login/codebuddy.txt
+codebuddy_login/configgithublogin.json
+codebuddy_login/device_tokens.txt
+codebuddy_login/proxy.txt
+codebuddy_login/results/
+codebuddy_login/bad_accounts.txt
+codebuddy_login/login_redirect.html
+codebuddy_login/cb_*.html
+debug/
+
+# === Local state / credentials (never commit) ===
+config.json.bak.*
+config.json
+.env
+accounts/
+camoufox/

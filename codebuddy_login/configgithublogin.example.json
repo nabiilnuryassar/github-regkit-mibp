@@ -1,0 +1,17 @@
+{
+    "concurrency": 1,
+    "delayMs": 15000,
+    "proxy": [
+        "http://USER-zone-custom-region-SG-session-label1-sessTime-10:PASSWORD@as.rotgb.trustsource.live:10000"
+    ],
+    "_comment": [
+        "One proxy per account. Sticky session labels keep the exit IP stable per account.",
+        "Generic grammar here is <user>-region-<CC>-session-<label>-sessTime-<minutes>;",
+        "adapt it to your provider. The real file is gitignored.",
+        "Optional `accounts` map pins each email to its own proxy so no account rides another account's exit IP or country. Without it, a proxy is picked at random.",
+        "711proxy: the session label must be <= 11 chars. Longer labels do not error, they silently leave the requested region."
+    ],
+    "accounts": {
+        "user@example.com": "http://USER-zone-custom-region-SG-session-lab1-sessTime-10:PASSWORD@as.rotgb.trustsource.live:10000"
+    }
+}

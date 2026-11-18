@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import contextlib
 import hashlib
 import logging
 import os
@@ -22,6 +23,8 @@ from .config import Config
 from .litensi import LitensiClient, LitensiError
 from .mail_errors import MailboxCancelled, MailboxTimeoutError
 from .mailcx import MailCxClient, MailCxError
+from . import engines
+from .engines import EngineUnavailable
 from .profiles import (
     generate_password,
     generate_username,
@@ -76,6 +79,14 @@ class GitHubRateLimited(SignupError):
     pass
 
 
+class MailboxAddressRejected(SignupError):
+    """GitHub refused the mailbox address itself (already registered).
+
+    Permanent per-address, so every retry fails identically: this account is
+    dropped instead of burning page reloads and session switches.
+    """
+
+
 _DATADOME_HARD_BLOCK_MARKERS = (
     "access is temporarily restricted",
     "we detected unusual activity",
@@ -92,6 +103,14 @@ _RATE_LIMIT_MARKERS = (
     "too many requests",
     "you have exceeded a secondary rate limit",
     "please wait a few minutes before you try again",
+)
+
+# GitHub serves this tiny no-JS page from behind DataDome when it decides the
+# session is not a real browser. It replaces the whole signup page, so the
+# post-submit state never resolves — it must be classified, not waited out.
+_JS_REJECTION_MARKERS = (
+    "please enable js and disable any ad blocker",
+    "enable javascript and cookies to continue",
 )
 
 
@@ -167,15 +186,52 @@ def load_proxy_pool(name: str) -> list[str]:
 
 
 def _pick_proxy_url(cfg: Config, log=None) -> str:
-    """Effective proxy URL: random pick from proxy_file pool, else the single URL."""
+    """Effective proxy URL, LOCKED for the current account.
+
+    GitHub fingerprints the network path: a signup that arrives from one exit
+    IP and then verifies/logs in from another country reads as account takeover
+    and gets suspended. So the first pick for an account is remembered and
+    reused by every later stage (engine fallbacks, session switches, relogin,
+    CodeBuddy OAuth). `account_proxy_begin()` clears it per account, and the
+    rate-limit/hard-block rotation clears it deliberately.
+    """
+    global _account_proxy
     name = (getattr(cfg, "proxy_file", "") or "").strip()
     if name:
         pool = load_proxy_pool(name)
         if pool:
-            return random.choice(pool)
+            if _account_proxy and _account_proxy in pool:
+                return _account_proxy
+            _account_proxy = random.choice(pool)
+            if log:
+                log(f"[*] proxy locked for this account: {_mask_proxy(_account_proxy)}")
+            return _account_proxy
         if log:
             log(f"[!] proxy file {name!r} missing/empty — falling back to single proxy URL")
-    return (cfg.proxy or "").strip()
+    if _account_proxy:
+        return _account_proxy
+    _account_proxy = (cfg.proxy or "").strip()
+    return _account_proxy
+
+
+def _mask_proxy(url: str) -> str:
+    """Identify the proxy without leaking its password.
+
+    These gateways give every session the same host:port and encode the sticky
+    session in the USERNAME, so host:port alone cannot tell two picks apart.
+    Keep the username, drop the secret.
+    """
+    p = urlsplit(url)
+    if not p.hostname:
+        return "(set)"
+    user = f"{p.username}@" if p.username else ""
+    return f"{user}{p.hostname}:{p.port or ''}"
+
+
+def account_proxy_begin() -> None:
+    """Start a new account: its next proxy pick is locked for the whole cycle."""
+    global _account_proxy
+    _account_proxy = None
 
 
 def _proxy_is_socks(proxy: Optional[dict]) -> bool:
@@ -232,6 +288,8 @@ def _socks_exit_ip(url: str, timeout: int = 12) -> str:
 
 _sticky_suffix: Optional[str] = None
 _last_exit_ip: Optional[str] = None
+_account_proxy: Optional[str] = None  # locked for one account's whole cycle
+_DISPLAY_WARNING_SHOWN = False
 
 
 def _ensure_sticky_proxy(url: str, log=None) -> str:
@@ -469,12 +527,33 @@ def _stop_proxy_bridge() -> None:
         _bridge = None
 
 
+def _stop_proxy_bridge_if_elsewhere(proxy_url: str) -> None:
+    """Drop the bridge when it relays to a different upstream than `proxy_url`.
+
+    The bridge is reused across launches of one account, but the account lock
+    can move (rotation, new account): a bridge still pointing at the previous
+    exit IP would silently undo the new proxy choice.
+    """
+    if _bridge is None:
+        return
+    wanted = _parse_proxy(proxy_url) or {}
+    up = _bridge._upstream
+    current = f"{'socks5' if up['socks'] else 'http'}://{up['host']}:{up['port']}"
+    if wanted.get("server") != current:
+        _stop_proxy_bridge()
+
+
 def _rotate_sticky_proxy() -> None:
-    """Discard a blocked DataImpulse sticky port and allocate a new one."""
-    global _sticky_suffix, _last_exit_ip
+    """Discard the current proxy for this account (blocked/rate-limited).
+
+    Clears the account lock too, so the next `_pick_proxy_url` really moves to a
+    different exit IP instead of handing back the proxy that just got blocked.
+    """
+    global _sticky_suffix, _last_exit_ip, _account_proxy
     _stop_proxy_bridge()
     _sticky_suffix = None
     _last_exit_ip = None
+    _account_proxy = None
 
 
 def _disable_blocked_proxy(log) -> None:
@@ -533,6 +612,38 @@ def _wait_step(page, selectors: list[str], label: str, timeout: int = 30) -> Non
         raise SignupError(f"{label} did not appear; body={_page_text(page)[:300]!r}")
 
 
+
+def _advance_form_step(page, selectors: list[str], label: str, log, stop, timeout: int = 30) -> None:
+    """GitHub's signup may hide later fields until earlier ones validate.
+
+    Wait for `selectors` to become visible; while hidden, click the signup
+    form's Continue/submit button (the step advancer) every ~2s. Raises
+    SignupError when the step never appears (reloadable by the Tier-1 loop).
+    """
+    deadline = time.time() + timeout
+    clicked = False
+    while True:
+        _raise_if_cancelled(stop)
+        _raise_if_rate_limited(page)
+        try:
+            if page.locator(", ".join(selectors)).first.is_visible():
+                if clicked and log:
+                    log(f"[*] {label} step appeared")
+                return
+        except Exception:
+            pass
+        if time.time() >= deadline:
+            break
+        try:
+            page.locator(", ".join(_SUBMIT_SELECTORS)).first.click(timeout=3000)
+            if log and not clicked:
+                log(f"[*] clicked Continue — waiting for {label} step")
+            clicked = True
+        except Exception:
+            pass
+        _sleep_with_cancel(2, stop)
+    raise SignupError(f"signup form did not advance to {label} step within {timeout}s")
+
 def _fill(page, selectors: list[str], value: str) -> None:
     _first(page, selectors, visible=True).fill(value)
 
@@ -564,6 +675,29 @@ def _human_fill(page, selectors: list[str], value: str, stop=None) -> None:
         field.evaluate("el => el.blur()")
     except Exception:
         pass
+
+
+def _is_blank_page(page) -> bool:
+    """Has the signup page lost its content entirely?
+
+    GitHub posts the form through an async GraphQL mutation; when that handler
+    fails the SPA leaves a blank shell on the /signup URL. No amount of waiting
+    renders the form — only a reload does.
+    """
+    try:
+        if (page.locator(_SIGNUP_FORM).count() or
+                page.locator("button[type='submit']").count()):
+            return False
+        return len(_page_text(page).strip()) < 40
+    except Exception:
+        return False
+
+
+def _email_taken(page) -> bool:
+    """Is the signup email already registered? (permanent, never retryable)"""
+    hint = _form_validation_hint(page).lower()
+    return "already associated with an account" in hint or \
+        "email has already been taken" in hint
 
 
 def _form_validation_hint(page) -> str:
@@ -651,8 +785,32 @@ def _confirm_order(mail, order_id: str, log) -> None:
                 # order already expired / auto-confirmed on the provider side
                 log(f"[i] litensi order {confirm_id} setstatus skipped "
                     f"(already past confirm window)")
+            elif "SUCCESS FAILED" in msg:
+                # the transition was refused — usually because the provider
+                # already marked the order SUCCESS (duplicate confirm). Verify
+                # with a read-only getstatus instead of guessing.
+                try:
+                    state = mail.get_status(confirm_id).get("status")
+                except Exception:
+                    state = ""
+                if state == "SUCCESS":
+                    log(f"[i] litensi order {confirm_id} already SUCCESS "
+                        f"(provider-side confirm; ours was a no-op)")
+                else:
+                    log(f"[i] litensi confirm failed (non-fatal): {exc} "
+                        f"(order status={state or 'unknown'})")
             else:
                 log(f"[i] litensi confirm failed (non-fatal): {exc}")
+
+
+def _is_js_rejection(page) -> bool:
+    """DataDome replaced the page with the 'enable JS' stub: the session is
+    rejected, not slow. Waiting longer cannot help — retry or rotate."""
+    try:
+        text = _page_text(page).lower()[:600]
+    except Exception:
+        return False
+    return any(marker in text for marker in _JS_REJECTION_MARKERS)
 
 
 def _is_hard_block(page) -> bool:
@@ -690,28 +848,31 @@ def _challenge_hint(page) -> str:
 
 
 def _try_click_datadome(page, log) -> None:
-    """Best-effort click on the DataDome checkbox iframe (headed mode)."""
+    """Click the DataDome checkbox once — never repeatedly.
+
+    DataDome solves itself after ~2-5s when the fingerprint passes. Repeatedly
+    clicking the challenge frame resets that solve (every click restarts the
+    interstitial), which is exactly how a solvable challenge turns into a
+    timeout. So: click only when the interactive checkbox is actually visible,
+    and let the frame finish on its own otherwise.
+    """
     try:
         for frame in page.frames:
-            if "captcha-delivery" in (frame.url or ""):
-                for sel in (
-                    "#ddv1-test-tracking",
-                    "input[type='checkbox']",
-                    "[id*='checkbox']",
-                    "label",
-                ):
-                    loc = frame.locator(sel).first
+            if "captcha-delivery" not in (frame.url or ""):
+                continue
+            for sel in ("#ddv1-test-tracking", "input[type='checkbox']",
+                        "[id*='checkbox']"):
+                loc = frame.locator(sel).first
+                try:
                     if loc.count() and loc.is_visible():
                         loc.click(timeout=3000)
                         log("[*] clicked DataDome checkbox")
                         return
-                # no checkbox: click somewhere in the challenge frame to trigger it
-                try:
-                    frame.locator("body").click(timeout=3000)
-                    log("[*] poked DataDome challenge frame")
                 except Exception:
-                    pass
-                return
+                    continue
+            # No checkbox yet: the interstitial is still deciding. Touching the
+            # body here only restarts it, so wait instead of poking.
+            return
     except Exception:
         pass
 
@@ -775,7 +936,7 @@ def _open_signup(page, log, attempts: int = 3, stop=None, headless: bool = False
                 link.click(timeout=10_000)
         except Exception as exc:
             log(f"[i] 'Sign up' link skipped: {exc}")
-        if _wait_for_signup(page, log, stop, 30):
+        if _wait_for_signup(page, log, stop, 20):
             log("[*] github.com/signup email form is ready")
             return
         last_hint = _challenge_hint(page) or last_hint
@@ -786,7 +947,7 @@ def _open_signup(page, log, attempts: int = 3, stop=None, headless: bool = False
                 page.goto(SIGNUP_URL, wait_until="domcontentloaded", timeout=60_000)
             except Exception as exc:
                 log(f"[!] direct /signup goto failed: {exc}")
-            if _wait_for_signup(page, log, stop, 25):
+            if _wait_for_signup(page, log, stop, 15):
                 log("[*] email form ready on direct /signup load")
                 return
             last_hint = _challenge_hint(page) or last_hint
@@ -794,16 +955,16 @@ def _open_signup(page, log, attempts: int = 3, stop=None, headless: bool = False
     if last_hint:
         if headless:
             # no visible window to solve the challenge in — fail fast instead of
-            # burning 120s on a manual-solve window that cannot be seen
+            # burning a manual-solve window that cannot be seen
             raise SignupError(
                 f"{last_hint} in headless mode — solve requires a visible browser "
                 f"window; use a residential proxy or set headless=false"
             )
-        # final long wait: challenge may need a manual click in the visible window
-        log(f"[!] {last_hint} — waiting up to 120s; solve the check in the browser window "
+        # final wait: an interactive challenge needs a human click in the window
+        log(f"[!] {last_hint} — waiting up to 60s; solve the check in the browser window "
             f"if visible, or configure a residential proxy")
         _try_click_datadome(page, log)
-        if _wait_for_signup(page, log, stop, 120):
+        if _wait_for_signup(page, log, stop, 60):
             log("[*] challenge passed, email form is ready")
             return
     raise SignupError(f"email form did not appear ({last_hint or 'no challenge marker'}); "
@@ -834,6 +995,12 @@ def _username_error(page) -> str:
         # fallback: visible error paragraphs mentioning the typed name
         text = _page_text(page)[:1200].lower()
         if "username is not available" in text or "username is already taken" in text:
+            return "taken"
+        # GitHub also renders the typed name in the message:
+        # 'Username wiramerona55 is not available.'
+        import re as _re
+        if _re.search(r"username\s+\S+\s+is\s+not\s+available", text) or \
+                _re.search(r"username\s+\S+\s+is\s+already\s+taken", text):
             return "taken"
     except Exception:
         pass
@@ -905,6 +1072,11 @@ def _click_create_account(page, log, wait_enabled: int = 30, stop=None) -> None:
     # not completed its email/password/username/Octocaptcha checks yet; forcing
     # it creates false submits, secondary rate-limit pressure, and stuck flows.
     hint = _form_validation_hint(page)
+    if _email_taken(page):
+        # Reloading cannot fix a registered address: every retry burns a full
+        # session and always fails the same way.
+        raise MailboxAddressRejected(
+            f"signup email is already registered ({hint}); order a new mailbox")
     raise SignupError(
         "Create account stayed disabled after validation wait"
         + (f": {hint}" if hint else " (Octocaptcha or async validation still pending)")
@@ -1043,9 +1215,31 @@ def _wait_post_submit(page, context, timeout: int = 120, log=None, stop=None) ->
     stable_hits = 0
     deadline = time.time() + timeout
     last_log = 0.0
+    js_rejections = 0
     while time.time() < deadline:
         _raise_if_cancelled(stop)
         _raise_if_rate_limited(page)
+        if _is_js_rejection(page):
+            # One reload is worth a try (the stub is served before DataDome's
+            # cookie lands); a second one means the session is refused outright.
+            js_rejections += 1
+            if js_rejections > 1:
+                raise SignupBlocked(
+                    "DataDome refused the session ('Please enable JS and disable any "
+                    "ad blocker') — the browser fingerprint or the exit IP is rejected; "
+                    "use a residential proxy or run headful so the check can be solved")
+            if log:
+                log("[!] DataDome JS-rejection stub — reloading once")
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=30_000)
+            except Exception:
+                pass
+            _sleep_with_cancel(3, stop)
+            continue
+        if _is_blank_page(page):
+            raise SignupError(
+                "signup page went blank after submit — GitHub's async signup "
+                "mutation failed for this session; a page reload is needed")
         state = _post_submit_state(page, context)
         if state != "pending":
             if state == stable_state:
@@ -1068,6 +1262,28 @@ def _wait_post_submit(page, context, timeout: int = 120, log=None, stop=None) ->
     )
 
 
+def _resolve_headless(cfg: Config, log=None) -> bool:
+    """Headful needs a display; when the host has none, start Xvfb before
+    giving up and going headless.
+
+    Headless rendering is a Picasso tell, so a virtual display is the better
+    fallback: the browser still paints real pixels into an X server, which is
+    what DataDome scores. Only when Xvfb is unavailable does the run truly go
+    headless — and that is logged, because a DataDome challenge can no longer
+    be solved manually from there.
+    """
+    if cfg.headless:
+        return True
+    if engines.ensure_display():
+        return False
+    global _DISPLAY_WARNING_SHOWN
+    if log and not _DISPLAY_WARNING_SHOWN:
+        _DISPLAY_WARNING_SHOWN = True
+        log("[!] no DISPLAY and Xvfb unavailable — falling back to headless; a DataDome "
+            "challenge cannot be solved without a visible window (use a residential proxy)")
+    return True
+
+
 def _browser_ctx_options(cfg: Config, log=None) -> dict:
     """Launch options tuned for DataDome (see 2026 field guides):
 
@@ -1088,7 +1304,8 @@ def _browser_ctx_options(cfg: Config, log=None) -> dict:
     """
     import platform
 
-    opts = {"headless": cfg.headless, "humanize": True, "geoip": True}
+    headless = _resolve_headless(cfg, log)
+    opts = {"headless": headless, "humanize": True, "geoip": True}
     host_os = platform.system()
     if host_os == "Darwin":
         opts["os"] = "macos"  # canvas/GPU class must match the real machine
@@ -1100,14 +1317,18 @@ def _browser_ctx_options(cfg: Config, log=None) -> dict:
     # IPs mid-session (DataImpulse default) are an instant DataDome flag
     raw_proxy = _pick_proxy_url(cfg, log=log)
     proxy_url = _ensure_sticky_proxy(raw_proxy, log=log) if raw_proxy else ""
+    opts["proxy_url"] = proxy_url  # engines that take a URL string (cloak/damru/...)
     proxy = _parse_proxy(proxy_url) if proxy_url else None
     if proxy:
         if _proxy_needs_bridge(proxy):
             # Firefox cannot authenticate to SOCKS5 — run a local no-auth HTTP
             # bridge that relays to the authed upstream with remote DNS.
             # Reuse an already-running bridge so a NEW bridge is NOT started
-            # for every fresh-profile launch (bridge is sticky-session-bound).
+            # for every fresh-profile launch (bridge is sticky-session-bound),
+            # but rebuild it when the account's locked proxy changed — a bridge
+            # to the previous account's exit IP would silently undo the lock.
             global _bridge
+            _stop_proxy_bridge_if_elsewhere(proxy_url)
             if _bridge is None:
                 _bridge = LocalAuthProxyBridge(proxy_url)
                 _bridge.start()
@@ -1153,6 +1374,88 @@ def _browser_ctx_options(cfg: Config, log=None) -> dict:
 
 _TRUST_FILE = ROOT / ".datadome-trust.json"
 _TRUST_COOKIE_NAMES = {"datadome", "datadome_proxied", "device_id", "_device_id"}
+
+# GitHub's authenticated session. `user_session` is the real credential;
+# `logged_in=yes` alone is a UI hint. Captured right after email verification
+# so the CodeBuddy OAuth hop reuses it instead of signing in a second time —
+# a fresh signup that logs in twice is exactly what GitHub flags.
+_SESSION_COOKIE_NAMES = {"user_session", "logged_in", "_gh_sess", "dotcom_user",
+                         "__Host-user_session_same_site", "preferred_color_mode"}
+SESSION_DIR = ROOT / "accounts" / "sessions"
+
+
+def _session_file(email: str) -> Path:
+    digest = hashlib.sha256(email.strip().lower().encode()).hexdigest()[:16]
+    return SESSION_DIR / f"{digest}.json"
+
+
+def _capture_github_session(context, email: str, log=None) -> bool:
+    """Persist this browser's authenticated GitHub cookies for `email`.
+
+    Returns False when the browser never authenticated (no user_session), which
+    is the honest signal — replaying a cookie jar without it does nothing.
+    """
+    try:
+        cookies = [c for c in context.cookies()
+                   if c.get("domain", "").endswith("github.com")]
+    except Exception as exc:
+        if log:
+            log(f"[i] session capture skipped: {exc}")
+        return False
+    if not any(c.get("name") in ("user_session", "__Host-user_session_same_site")
+               for c in cookies):
+        if log:
+            log("[i] no user_session yet — session not captured")
+        return False
+    try:
+        SESSION_DIR.mkdir(parents=True, exist_ok=True)
+        _session_file(email).write_text(json.dumps({
+            "email": email,
+            "cookies": cookies,
+            "exit_ip": _last_exit_ip or "",
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+        }, indent=1), encoding="utf-8")
+        try:
+            os.chmod(_session_file(email), 0o600)  # a session is a live credential
+        except OSError:
+            pass
+        if log:
+            log(f"[*] github session captured ({len(cookies)} cookies)")
+        return True
+    except Exception as exc:
+        if log:
+            log(f"[!] session capture failed: {exc}")
+        return False
+
+
+def _load_github_session(email: str) -> list[dict]:
+    path = _session_file(email)
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data.get("cookies") or []
+    except Exception:
+        return []
+
+
+def _inject_github_session(context, email: str, log=None) -> bool:
+    """Put the captured GitHub session into a NEW browser context."""
+    cookies = _load_github_session(email)
+    if not cookies:
+        if log:
+            log("[i] no stored github session for this account")
+        return False
+    try:
+        context.add_cookies(cookies)
+        if log:
+            log(f"[*] github session injected ({len(cookies)} cookies)")
+        return True
+    except Exception as exc:
+        if log:
+            log(f"[!] session injection failed: {exc}")
+        return False
+
 
 
 def _save_trust_cookie(context, log=None) -> None:
@@ -1226,18 +1529,46 @@ def _restore_trust_cookie(context, log=None) -> None:
             log(f"[i] trust cookie restore failed: {exc}")
 
 
-def _context_and_page(browser):
+def _headless_chromium_context_kwargs(page_factory, opts: dict) -> dict:
+    """Context kwargs that remove the remaining headless tell on Chromium.
+
+    `--disable-blink-features=AutomationControlled` (see engines) already drops
+    `navigator.webdriver`; the UA string still carries the `HeadlessChrome`
+    token. Patchright deliberately no-ops `add_init_script` (an injected script
+    is itself a tell), so the UA override is the whole available surface here.
+    """
+    if not opts.get("headless"):
+        return {}
+    probe = page_factory()
+    try:
+        ua = probe.evaluate("navigator.userAgent")
+    finally:
+        probe.close()
+    if "HeadlessChrome" not in ua:
+        return {}
+    return {"user_agent": ua.replace("HeadlessChrome", "Chrome")}
+
+
+def _context_and_page(browser, opts: Optional[dict] = None):
     """Return (context, page) for BOTH launch modes.
 
     persistent_context=True -> Camoufox returns a BrowserContext with one page
     fresh launch             -> Camoufox returns a Browser; create a context
                                 + page ourselves.
+
+    `opts` enables the headless Chromium UA patch; a headful or Camoufox
+    context is left exactly as the engine built it.
     """
+    opts = opts or {}
     if hasattr(browser, "cookies"):  # BrowserContext (persistent mode)
         context = browser
-        page = context.pages[0] if context.pages else context.new_page()
+        pages = getattr(context, "pages", None)
+        page = pages[0] if pages else context.new_page()
     else:  # Browser (fresh mode)
-        context = browser.new_context(locale="en-US")
+        kw = {"locale": "en-US"}
+        if getattr(browser, "_headless_chromium", False):
+            kw.update(_headless_chromium_context_kwargs(browser.new_page, opts))
+        context = browser.new_context(**kw)
         page = context.new_page()
     return context, page
 
@@ -1276,16 +1607,94 @@ def _fill_launch_code(page, code: str, log) -> None:
     count = boxes.count()
     if count >= len(code):  # 8 boxes for an 8-digit code
         for i, digit in enumerate(code):
-            boxes.nth(i).fill(digit)
-            time.sleep(0.15)  # small human cadence between boxes
+            try:
+                box = boxes.nth(i)
+                box.click(timeout=3000)
+                # explicit short timeouts: a stalled fill() used the page's
+                # 20s default and let later boxes miss digits unlogged
+                box.fill("", timeout=3000)
+                box.press_sequentially(digit, delay=60, timeout=5000)
+            except Exception:
+                # GitHub re-renders the boxes after the last digit; a stale
+                # handle here means the code was already accepted.
+                pass
+            time.sleep(0.12)  # small human cadence between boxes
+        # READBACK: a box that silently missed its digit submits a wrong code
+        # and GitHub just re-shows the verify page — indistinguishable from a
+        # flagged account. Repair mismatches via the native value setter so
+        # React state sees every digit before submit.
+        mismatch = []
+        for i, digit in enumerate(code):
+            try:
+                if boxes.nth(i).input_value(timeout=2000) != digit:
+                    mismatch.append(i)
+            except Exception:
+                mismatch.append(i)
+        if mismatch:
+            log(f"[!] launch code readback mismatch in boxes {mismatch} — repairing")
+            try:
+                page.evaluate(
+                    """([pairs]) => {
+                        const setter = Object.getOwnPropertyDescriptor(
+                            window.HTMLInputElement.prototype, "value").set;
+                        const els = document.querySelectorAll("input[id^='launch-code-']");
+                        for (const [i, d] of pairs) {
+                            const el = els[i];
+                            if (!el) continue;
+                            setter.call(el, d);
+                            el.dispatchEvent(new Event("input", {bubbles: true}));
+                        }
+                    }""",
+                    [[[i, code[i]] for i in mismatch]],
+                )
+            except Exception as exc:
+                log(f"[!] launch code repair failed: {exc}")
         log(f"[*] launch code typed into {len(code)} boxes")
+        time.sleep(1.0)
         try:
-            page.locator(
-                "button[class*='Button--primary'], button[class*='Button-module__Button--primary']"
-            ).first.click(timeout=5000)
-            log("[*] launch code submitted")
+            still_here = _verify_input_visible(page) and "account_verifications" in (page.url or "")
         except Exception:
-            log("[*] no submit button found — launch code may auto-submit")
+            still_here = False  # DOM navigated away mid-check
+        if not still_here:
+            log("[*] launch code auto-submitted")
+            return
+        submit_sel = (
+            "button[class*='Button--primary'], "
+            "button[class*='Button-module__Button--primary'], "
+            "form button[type='submit'], "
+            "form input[type='submit']"
+        )
+        btn = page.locator(submit_sel).first
+        try:
+            if btn.count() and btn.is_visible() and btn.is_enabled():
+                btn.click(timeout=4000)
+                log("[*] launch code submitted")
+                return
+        except Exception as exc:
+            log(f"[i] launch code button click failed ({exc}); trying DOM/form submit")
+        submitted = page.evaluate(
+            """(sel) => {
+                const b = document.querySelector(sel);
+                if (b && !b.disabled) { b.click(); return 'dom-button'; }
+                const box = document.querySelector("input[id^='launch-code-']");
+                const form = box && box.form;
+                if (form) {
+                    if (typeof form.requestSubmit === 'function') form.requestSubmit();
+                    else form.submit();
+                    return 'form-submit';
+                }
+                return '';
+            }""",
+            submit_sel,
+        )
+        if submitted:
+            log(f"[*] launch code submitted ({submitted})")
+        else:
+            try:
+                boxes.nth(len(code) - 1).press("Enter")
+                log("[*] launch code submitted (Enter)")
+            except Exception:
+                log("[*] no submit button or form found — waiting for auto-submit")
         return
     # single input fallback
     otp = _first(page, _OTP_INPUTS, visible=True)
@@ -1326,7 +1735,15 @@ def _try_login(
     """
     used = set(used_codes or ())
     try:
+        # The caller may be on the landing page (GitHub drops verified new
+        # accounts at '/'), so open /login first — otherwise there is no form
+        # to fill and the login silently "succeeds" with no session.
         user = page.locator(", ".join(_LOGIN_INPUTS)).first
+        if not (user.count() and user.is_visible()):
+            log("[*] opening /login for the post-signup session")
+            page.goto("https://github.com/login", wait_until="domcontentloaded",
+                      timeout=60_000)
+            user = page.locator(", ".join(_LOGIN_INPUTS)).first
         if not user.is_visible():
             return _logged_in(context)
         user.fill(username, timeout=5000)
@@ -1510,6 +1927,286 @@ def _fetch_public_profile() -> dict[str, str]:
     random_user = requests.get("https://randomuser.me/api/", timeout=15).json()
     quote = requests.get("https://zenquotes.io/api/random", timeout=15).json()
     return parse_public_profile(random_user, quote)
+
+
+def _codebuddy_with_stored_session(cfg: Config, email: str, log) -> bool:
+    """Replay the captured GitHub session into a fresh browser, then OAuth.
+
+    Used when the signup browser never established a session (GitHub parks new
+    accounts on the marketing page or on /suspended). No credential is replayed
+    and no second login happens: only the cookie jar captured at verification.
+    """
+    cookies = _load_github_session(email)
+    if not cookies:
+        log("[!] codebuddy: no stored github session to reuse")
+        return False
+    opts = _browser_ctx_options(cfg, log=log)
+    with engines.launch_engine(cfg.engine or "cloakbrowser", cfg, opts, log) as browser:
+        context, page = _context_and_page(browser, opts)
+        page.set_default_timeout(30_000)
+        if getattr(cfg, "fresh_profile", False):
+            _restore_trust_cookie(context, log)
+        if not _inject_github_session(context, email, log):
+            return False
+        page.goto("https://github.com/", wait_until="domcontentloaded", timeout=60_000)
+        if not _logged_in(context):
+            log("[!] codebuddy: injected session is not authenticated "
+                "(GitHub did not honour the cookies) — account likely restricted")
+            return False
+        log("[*] codebuddy: github session live from stored cookies")
+        return _login_codebuddy_with_session(page, cfg, log, email)
+
+
+_CB = "https://www.codebuddy.ai"
+_CB_AUTH = (_CB + "/auth/realms/copilot/protocol/openid-connect/auth?client_id=console"
+            "&response_type=code&redirect_uri=https%3A%2F%2Fwww.codebuddy.ai%2Flogin%2Fselect"
+            "%3Fredirect_uri%3Dhttps%253A%252F%252Fwww.codebuddy.ai%252Fhome"
+            "&v=2210&product=codebuddy")
+
+
+CODEBUDDY_TOKENS_DIR = ROOT / "accounts" / "codebuddy"
+
+_CB_CLI_HEADERS = {
+    "X-Domain": "www.codebuddy.ai",
+    "X-No-Authorization": "true",
+    "X-No-User-Id": "true",
+    "X-No-Enterprise-Id": "true",
+    "X-No-Department-Info": "true",
+    "Accept": "application/json",
+}
+
+
+def _cb_mint_cli_state(page, log) -> str:
+    """Create a `platform=CLI` auth state BEFORE the OAuth login.
+
+    Crawled from the harvester: the CLI state must exist before the website
+    session authorises it; minting it afterwards gets refused at the bind.
+    """
+    try:
+        r = page.request.post(
+            f"{_CB}/v2/plugin/auth/state?platform=CLI",
+            data="{}",
+            headers={**_CB_CLI_HEADERS, "Content-Type": "application/json",
+                     "Host": "www.codebuddy.ai"},
+            timeout=30_000,
+        )
+        body = r.json() if r.ok else {}
+        state = ((body.get("data") or {}).get("state") or "")
+        if state:
+            log(f"[*] codebuddy: CLI state minted ({state[:10]}…)")
+        else:
+            log(f"[!] codebuddy: CLI state missing (HTTP {r.status})")
+        return state
+    except Exception as exc:
+        log(f"[!] codebuddy: CLI state request failed ({str(exc)[:70]})")
+        return ""
+
+
+def _cb_fetch_cli_token(page, state: str, email: str, log) -> bool:
+    """Bind the state to the logged-in session, then poll for the bearer.
+
+    The bind answers 11217 ('RetryFetchToken') while it settles, so the poll is
+    bounded and every code is logged — a refused bind shows up as 401 on the
+    bind itself rather than as a silent wait.
+    """
+    if not state:
+        return False
+    try:
+        bind = page.request.get(
+            f"{_CB}/console/auth/login?platform=CLI&state={state}&domain=www.codebuddy.ai",
+            headers=_CB_CLI_HEADERS, timeout=30_000,
+        )
+        log(f"[*] codebuddy: CLI bind HTTP {bind.status}")
+    except Exception as exc:
+        log(f"[!] codebuddy: CLI bind failed ({str(exc)[:70]})")
+        return False
+
+    for attempt in range(20):
+        try:
+            r = page.request.get(
+                f"{_CB}/v2/plugin/auth/token?state={state}",
+                headers=_CB_CLI_HEADERS, timeout=30_000,
+            )
+            data = (r.json() if r.ok else {})
+            payload = data.get("data") or {}
+            token = payload.get("accessToken") or ""
+            if token:
+                _save_codebuddy_tokens(email, payload, log)
+                log(f"[*] codebuddy: TOKEN OK — access {len(token)}c, "
+                    f"refresh {len(payload.get('refreshToken') or '')}c")
+                return True
+            log(f"[i] codebuddy: token poll {attempt + 1}/20 — "
+                f"code={data.get('code')} {str(data.get('msg') or '')[:40]}")
+        except Exception as exc:
+            log(f"[i] codebuddy: token poll {attempt + 1} error ({str(exc)[:50]})")
+        _sleep_with_cancel(3, None)
+    log("[!] codebuddy: token never arrived after 20 polls")
+    return False
+
+
+def _save_codebuddy_tokens(email: str, payload: dict, log) -> None:
+    """Write the CLI bearer next to the accounts file (mode 600)."""
+    try:
+        CODEBUDDY_TOKENS_DIR.mkdir(parents=True, exist_ok=True)
+        slug = "".join(c if c.isalnum() else "_" for c in email.lower())
+        path = CODEBUDDY_TOKENS_DIR / f"{slug}_cli_tokens.json"
+        path.write_text(json.dumps({
+            "email": email,
+            "accessToken": payload.get("accessToken", ""),
+            "refreshToken": payload.get("refreshToken", ""),
+            "expiresIn": payload.get("expiresIn", 0),
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+        }, indent=1), encoding="utf-8")
+        with contextlib.suppress(OSError):
+            os.chmod(path, 0o600)  # a bearer token is a live credential
+        log(f"[*] codebuddy: tokens saved to accounts/codebuddy/{path.name}")
+    except Exception as exc:
+        log(f"[!] codebuddy: saving tokens failed ({str(exc)[:60]})")
+
+
+def _login_codebuddy_with_session(page, cfg: Config, log, email: str = "") -> bool:
+    """Sign in to CodeBuddy with the GitHub session that is already live here.
+
+    Crawled flow (the SPA at /login/select never finishes rendering without a
+    bootstrap cookie, so it must not be opened directly):
+
+      1. GET  /console/accounts        -> 302 + `session` cookie   (bootstrap)
+      2. GET  Keycloak realm auth      -> page with the broker href
+      3. GET  /auth/realms/copilot/broker/github/login?...
+                                       -> 302 to github.com/login/oauth/authorize
+      4. POST the GitHub consent form  (the only step needing a human)
+
+    Steps 1-3 are plain navigations; step 4 is a real click so GitHub sees the
+    consent in the authenticated session and nothing is replayed.
+
+    Returns True when CodeBuddy lands back on its own origin, authenticated.
+    """
+    if not getattr(cfg, "codebuddy_login", False):
+        return False
+    log("[*] codebuddy: bootstrapping a session cookie")
+    try:
+        # Bootstrap: this 302 hands out the `session` cookie the SPA waits for.
+        page.goto(f"{_CB}/console/accounts", wait_until="commit", timeout=45_000)
+        _sleep_with_cancel(2, None)
+    except Exception as exc:
+        log(f"[!] codebuddy: bootstrap failed ({str(exc)[:80]})")
+        return False
+
+    log("[*] codebuddy: opening the CodeBuddy sign-in page")
+    try:
+        # The bootstrap redirect already lands on this page; re-open it only
+        # when it did not, since the page carries the one-shot session_code.
+        if "openid-connect/auth" not in (page.url or ""):
+            page.goto(_CB_AUTH, wait_until="commit", timeout=45_000)
+        _sleep_with_cancel(3, None)
+    except Exception as exc:
+        log(f"[!] codebuddy: sign-in page failed ({str(exc)[:80]})")
+
+    # The CLI state must exist BEFORE the OAuth authorises the website session;
+    # minting it afterwards is refused at the bind (crawled behaviour).
+    cli_state = _cb_mint_cli_state(page, log)
+
+    broker = _codebuddy_broker_href(page)
+    if broker:
+        log("[*] codebuddy: following the GitHub broker hop")
+        try:
+            page.goto(broker, wait_until="commit", timeout=45_000)
+            _sleep_with_cancel(2, None)
+        except Exception as exc:
+            log(f"[i] codebuddy: broker navigation ({str(exc)[:70]})")
+
+    for step in range(10):
+        url = page.url or ""
+        # GitHub bounces the consent hop through /login when the browser's
+        # session is NOT live. That is the one case this path cannot finish: the
+        # session must have been established during signup.
+        if "github.com/login" in url and "return_to" in url:
+            log("[!] codebuddy: github session is not live here — the OAuth hop "
+                "landed on the sign-in form; capture must happen during signup")
+            return False
+        if "/login/oauth/authorize" in url:
+            try:
+                page.wait_for_selector(
+                    "button[type='submit'], input[type='submit'], "
+                    "button:has-text('Authorize')", timeout=15_000)
+            except Exception:
+                pass
+            body = _safe_page_html(page)
+            if "This account is flagged" in body:
+                log("[!] codebuddy: GitHub refuses OAuth ('account is flagged')")
+                return False
+            if _approve_github_oauth(page, log):
+                _sleep_with_cancel(3, None)
+                continue
+        if _codebuddy_authenticated(url):
+            log(f"[*] codebuddy: signed in ({url.split('?')[0]})")
+            if cli_state:
+                _cb_fetch_cli_token(page, cli_state, email, log)
+            return True
+        # Detour pages: broker landing, Keycloak "continue", provider buttons.
+        href = _codebuddy_broker_href(page)
+        if href:
+            try:
+                page.goto(href, wait_until="commit", timeout=45_000)
+                _sleep_with_cancel(2, None)
+                continue
+            except Exception:
+                pass
+        _sleep_with_cancel(2, None)
+    log(f"[!] codebuddy: handoff stalled (url={(page.url or '')[:90]})")
+    return False
+
+
+def _safe_page_html(page, limit: int = 20000) -> str:
+    try:
+        return (page.content() or "")[:limit]
+    except Exception:
+        return ""
+
+
+def _codebuddy_broker_href(page, wait_ms: int = 15_000) -> str:
+    """The GitHub broker URL offered by the CodeBuddy login page, or ''.
+
+    Crawled: the option is `<a id="social-github">` and its href is ABSOLUTE and
+    fully parameterised (tab_id + session_code + client_data). Clicking it does
+    nothing under Playwright (the SPA swallows the event), so the href itself is
+    what must be followed. The link renders async, so wait for it instead of
+    scraping the HTML once.
+    """
+    try:
+        page.wait_for_selector("#social-github", timeout=wait_ms)
+        href = page.get_attribute("#social-github", "href") or ""
+    except Exception:
+        return ""
+    href = href.replace("&amp;", "&").strip()
+    if not href:
+        return ""
+    return href if href.startswith("http") else _CB + href
+
+
+def _codebuddy_authenticated(url: str) -> bool:
+    """CodeBuddy origin reached with no auth hop in the URL."""
+    u = url or ""
+    if "codebuddy.ai" not in u:
+        return False
+    if any(k in u for k in ("/auth/realms", "/login/select", "/login/oauth", "broker/")):
+        return False
+    return "/home" in u or "/console" in u
+
+
+def _approve_github_oauth(page, log) -> bool:
+    """Submit the GitHub OAuth consent form for a third-party app."""
+    try:
+        btn = page.locator(
+            "button[type='submit'], input[type='submit'], "
+            "button:has-text('Authorize'), button:has-text('Allow')").first
+        if btn.count() and btn.is_visible():
+            btn.click(timeout=8_000)
+            log("[*] codebuddy: GitHub OAuth consent approved")
+            return True
+    except Exception as exc:
+        log(f"[i] codebuddy: consent click failed ({str(exc)[:70]})")
+    return False
 
 
 def _visible_dom_click(page, matcher_js: str) -> bool:
@@ -1732,22 +2429,12 @@ def _enable_2fa(page, log) -> tuple[str, str]:
     totp = pyotp.TOTP(secret)
     code = totp.now()
     log(f"[*] TOTP code generated: {code}")
-    # the ENABLED otp input is the one with aria-label; input[name='otp'] is a
-    # hidden/disabled twin (from the recording) — fill the enabled one.
-    otp_input = page.locator(
-        "input[aria-label='Verify the code from the app']:not([disabled])"
-    ).first
-    try:
-        otp_input.fill(code, timeout=10_000)
-    except Exception:
-        otp_input = page.locator("input[name='otp']:not([disabled])").first
-        otp_input.fill(code, timeout=10_000)
 
     # --- helper: click the VISIBLE enabled wizard button by its label ---
     # The wizard keeps all steps' buttons in the DOM; Playwright's is_visible()
     # is unreliable there, so use the browser's own visibility semantics
     # (offsetParent !== null) to find the ACTIVE step's button.
-    def _click_active_wizard_button(page, label: str) -> bool:
+    def _click_active_wizard_button(label: str) -> bool:
         try:
             clicked = page.evaluate(
                 """(label) => {
@@ -1771,10 +2458,9 @@ def _enable_2fa(page, log) -> tuple[str, str]:
         except Exception:
             return False
 
-    if not _click_active_wizard_button(page, "Continue"):
-        # fallback: any visible enabled next button (its label may be icon-only)
+    def _click_any_active_next() -> bool:
         try:
-            page.evaluate(
+            return bool(page.evaluate(
                 """() => {
                     const btns = [...document.querySelectorAll(
                         "button[data-target='single-page-wizard-step.nextButton']"
@@ -1784,9 +2470,55 @@ def _enable_2fa(page, log) -> tuple[str, str]:
                     }
                     return false;
                 }"""
+            ))
+        except Exception:
+            return False
+
+    def _find_verify_input():
+        # The enabled otp input is the one with aria-label (from the old
+        # recording); input[name='otp'] is a hidden/disabled twin. Fall back
+        # to ANY visible non-hidden input inside the wizard when the recording
+        # selectors are stale.
+        for sel in (
+            "input[aria-label='Verify the code from the app']:not([disabled])",
+            "input[name='otp']:not([disabled])",
+            "input:not([type='hidden']):not([disabled]):visible",
+        ):
+            try:
+                el = page.locator(sel).first
+                if el.count() and el.is_visible():
+                    return el
+            except Exception:
+                pass
+        return None
+
+    otp_input = _find_verify_input()
+    if otp_input is None:
+        # The wizard now starts on an intro step; the verify input renders on
+        # the NEXT step (hidden until advanced). Advance once, then retry.
+        _click_active_wizard_button("Continue") or _click_any_active_next()
+        for _ in range(5):
+            time.sleep(1)
+            otp_input = _find_verify_input()
+            if otp_input:
+                break
+    if otp_input is None:
+        try:
+            inputs = page.evaluate(
+                """() => [...document.querySelectorAll('input')].map(i => ({
+                    name: i.name, id: i.id, type: i.type,
+                    aria: i.getAttribute('aria-label'),
+                    vis: i.offsetParent !== null
+                }))"""
             )
         except Exception:
-            pass
+            inputs = []
+        raise SignupError(f"2FA verify input never became visible; inputs={inputs!r}")
+    otp_input.fill(code, timeout=10_000)
+
+    if not _click_active_wizard_button("Continue"):
+        # fallback: any visible enabled next button (its label may be icon-only)
+        _click_any_active_next()
     log("[*] TOTP code submitted → Continue")
     time.sleep(3)
 
@@ -1848,37 +2580,13 @@ def _enable_2fa(page, log) -> tuple[str, str]:
     except Exception as exc:
         log(f"[i] recovery codes download skipped: {exc}")
 
-    if _click_active_wizard_button(page, "I have saved my recovery codes"):
-        log("[*] recovery codes confirmed")
-    else:
-        # fallback: click by data-action nextButton (visible one)
-        page.evaluate(
-            """() => {
-                const btns = [...document.querySelectorAll(
-                    "button[data-target='single-page-wizard-step.nextButton']"
-                )];
-                for (const b of btns) {
-                    if (b.offsetParent !== null && !b.disabled) { b.click(); return true; }
-                }
-                return false;
-            }"""
-        )
-        log("[*] recovery codes confirmed (fallback)")
+    if not _click_active_wizard_button("I have saved my recovery codes"):
+        _click_any_active_next()
+    log("[*] recovery codes confirmed")
     time.sleep(2)
-    if _click_active_wizard_button(page, "Done"):
-        log("[*] 2FA wizard finished")
-    else:
-        page.evaluate(
-            """() => {
-                const btns = [...document.querySelectorAll(
-                    "button[data-target='single-page-wizard-step.nextButton']"
-                )];
-                for (const b of btns) {
-                    if (b.offsetParent !== null && !b.disabled) { b.click(); return true; }
-                }
-                return false;
-            }"""
-        )
+    if not _click_active_wizard_button("Done"):
+        _click_any_active_next()
+    log("[*] 2FA wizard finished")
     time.sleep(2)
 
     # persist recovery codes next to the accounts file for account recovery
@@ -1906,9 +2614,11 @@ def _fill_signup_form(page, cfg, email, password, log, stop) -> str:
     _human_fill(page, _EMAIL_INPUTS, email, stop=stop)
     _sleep_with_cancel(1.5, stop)
     _raise_if_rate_limited(page)
+    _advance_form_step(page, _PASSWORD_INPUTS, "password", log, stop)
     _human_fill(page, _PASSWORD_INPUTS, password, stop=stop)
     _sleep_with_cancel(1.5, stop)
     _raise_if_rate_limited(page)
+    _advance_form_step(page, _USERNAME_INPUTS, "username", log, stop)
     # 3s pause after username -> CLICK Create account -> on username error
     # append one digit and retry (name -> name2 -> name3 ...)
     return _fill_and_create_account(
@@ -1945,7 +2655,56 @@ def _post_form_flow(
         # after OTP: must reach a logged-in state
         state2 = _wait_post_submit(page, context, timeout=90, log=log, stop=stop)
         if state2 == "verify":
-            raise SignupError("verification code rejected (still on verify page)")
+            # Judge by the SESSION, not by a transient DOM/URL snapshot: the
+            # verification page swaps to the marketing shell the moment the
+            # code is accepted, and a leftover code input from that swap is not
+            # a rejection while logged_in=yes already exists.
+            if not _logged_in(context) and _verify_input_visible(page):
+                _sleep_with_cancel(3, stop)  # let the post-submit redirect land
+                if not _logged_in(context) and _verify_input_visible(page):
+                    body_snippet = _page_text(page)[:200]
+                    # GitHub's INLINE reason (wrong code vs flagged account)
+                    # lives in the flash/alert region — the marketing header
+                    # alone cannot tell the two apart.
+                    inline = ""
+                    try:
+                        inline = " | ".join(
+                            t.strip()
+                            for t in (
+                                page.locator("#js-flash-container").inner_text(timeout=3000),
+                                page.locator("[role='alert']").first.inner_text(timeout=3000),
+                            )
+                            if t and t.strip()
+                        )
+                    except Exception:
+                        pass
+                    shot = ""
+                    try:
+                        shot_path = ROOT / "debug" / (
+                            "verify_rejected_"
+                            + datetime.now().strftime("%Y%m%d_%H%M%S")
+                            + ".png"
+                        )
+                        shot_path.parent.mkdir(parents=True, exist_ok=True)
+                        page.screenshot(path=str(shot_path))
+                        shot = f"; screenshot={shot_path}"
+                    except Exception:
+                        pass
+                    log(
+                        f"[!] verify input still visible; body={body_snippet!r}"
+                        f"; inline_error={inline!r}{shot}"
+                    )
+                    raise SignupError(
+                        f"verification code rejected (still on verify page): "
+                        f"body={body_snippet!r} inline_error={inline!r}{shot}"
+                    )
+            # Code accepted (session cookie present, or the verify form cleared):
+            # never throw away an account that was just created.
+            log(f"[*] verification accepted (logged_in={_logged_in(context)}, "
+                f"url={page.url}) — continuing to the logged-in check")
+        # First chance to keep the session: GitHub is authenticated here even
+        # when it lands on the marketing page afterwards.
+        _capture_github_session(context, email, log)
 
     def _finalize(post_login: bool) -> tuple[str, str, str]:
         """Run the optional post-login stages (repo, 2FA, profile).
@@ -1957,6 +2716,7 @@ def _post_form_flow(
         totp_secret = ""
         recovery = ""
         if post_login:
+            _capture_github_session(context, email, log)  # refresh after 2FA/login
             # ---- stage 4: create first repository ----
             if cfg.create_repo:
                 try:
@@ -1974,6 +2734,21 @@ def _post_form_flow(
                 _complete_profile(page, username, cfg, log)
             except Exception as exc:
                 log(f"[i] profile stage skipped (account still saved): {exc}")
+        # ---- stage 6: CodeBuddy sign-in ----
+        # Runs even without a live session: the captured cookies are replayed
+        # into a fresh context, so the OAuth hop never signs in a second time.
+        if getattr(cfg, "codebuddy_login", False):
+            try:
+                if post_login:
+                    ok = _login_codebuddy_with_session(page, cfg, log, email)
+                else:
+                    ok = _codebuddy_with_stored_session(cfg, email, log)
+                if ok:
+                    log("[+] codebuddy: authenticated for this account")
+                else:
+                    log("[!] codebuddy: not authenticated (account still saved)")
+            except Exception as exc:
+                log(f"[i] codebuddy stage skipped (account still saved): {exc}")
         try:
             _save_trust_cookie(context, log)  # persist DataDome trust for the next fresh run
         except Exception as exc:
@@ -1982,6 +2757,7 @@ def _post_form_flow(
 
     # state 'done' required — no more accepting bare redirects
     deadline = time.time() + 60
+    login_tried = False
     while time.time() < deadline:
         _raise_if_cancelled(stop)
         _raise_if_rate_limited(page)
@@ -1989,7 +2765,12 @@ def _post_form_flow(
             log("[*] logged_in cookie confirmed — account is active")
             return _finalize(post_login=True)
         # GitHub sends fresh signups to /login: sign in with the new creds
-        if "/login" in (page.url or ""):
+        if "/login" in (page.url or "") or (not login_tried and time.time() > deadline - 25):
+            # Second trigger: verification finished without establishing a
+            # session (GitHub drops new accounts on the marketing page). The
+            # credentials are valid, so sign in explicitly instead of saving an
+            # account nobody is logged into — stages 4/5 need that session.
+            login_tried = True
             if _try_login(
                 page, email, password, context, log,
                 mail=mail, order_id=order_id, email=email,
@@ -2044,19 +2825,74 @@ def _run_signup(
     Tier 2 (slow, expensive): if Tier 1 exhausts, close the browser and open
     a completely fresh session (new fingerprint / cookies) and try again. Up
     to `session_reloads` full-session restarts.
+
+    Tier 3 (engine fallback): if an engine is not installed (EngineUnavailable)
+    or all of its sessions fail (SignupError), the run continues with the NEXT
+    engine from `engine_order` (exclusive when `engine` is set). The mailbox is
+    ordered once and reused across engines, so a fallback never burns a second
+    mailbox.
     """
     page_reloads = 3      # in-session refresh (Cmd+R) attempts before switching session
     session_reloads = 2   # full browser restarts (new fingerprint) after page reloads fail
+    engine_keys = engines.resolve_engine_order(cfg)
+    log(f"[*] engines: {', '.join(engine_keys)}")
+    last_exc: Exception | None = None
+    for engine_key in engine_keys:
+        _raise_if_cancelled(stop)
+        if last_exc is not None:
+            log(f"[*] ENGINE fallback -> {engine_key} ({str(last_exc)[:140]})")
+        try:
+            return _run_signup_with_engine(
+                cfg, engine_key, password, mail, provider, pending, log, stop,
+                page_reloads=page_reloads, session_reloads=session_reloads,
+            )
+        except EngineUnavailable as exc:
+            last_exc = exc
+            log(f"[!] engine {engine_key} unavailable: {exc}")
+        except SignupError as exc:
+            last_exc = exc
+            log(f"[!] engine {engine_key} failed: {exc}")
+    msg = str(last_exc)
+    if any(k in msg.lower() for k in ("datadome", "challenge", "connection", "timeout")):
+        # Every engine died on the NETWORK, not on the form: the locked exit IP
+        # is the common factor. Signal the caller to retry with another proxy.
+        raise SignupError(f"all engines failed on network/anti-bot: {last_exc}") from last_exc
+    raise SignupError(
+        f"all engines failed for this account: {last_exc} "
+        f"(engines tried: {', '.join(engine_keys)}; a package missing from this "
+        f"interpreter says nothing about the other venvs on the host — run the "
+        f"server with the venv that has them installed)")
+
+
+def _run_signup_with_engine(
+    cfg: Config,
+    engine_key: str,
+    password: str,
+    mail: MailCxClient,
+    provider: str,
+    pending: dict,
+    log,
+    stop,
+    page_reloads: int = 3,
+    session_reloads: int = 2,
+) -> tuple[str, str]:
+    """Tier-1 (page reload) + Tier-2 (session switch) loop for ONE engine.
+
+    Raises EngineUnavailable when the engine cannot start at all and
+    SignupError when its sessions are exhausted — both make `_run_signup`
+    fall back to the next engine in the order.
+    """
     last_exc: Exception | None = None
     for session_attempt in range(1, session_reloads + 2):
         _raise_if_cancelled(stop)
         if session_attempt > 1:
             log(f"[*] SESSION switch {session_attempt - 1}/{session_reloads} "
                 f"(fresh browser + new fingerprint)")
-        with Camoufox(**_browser_ctx_options(cfg, log=log if session_attempt == 1 else None)) as browser:
+        opts = _browser_ctx_options(cfg, log=log if session_attempt == 1 else None)
+        with engines.launch_engine(engine_key, cfg, opts, log) as browser:
             # works for BOTH modes: persistent context (BrowserContext) and fresh
             # launch (Browser -> new context/page per account)
-            context, page = _context_and_page(browser)
+            context, page = _context_and_page(browser, opts)
             if getattr(cfg, "fresh_profile", False):
                 # fresh mode: inject ONLY the DataDome trust cookie (no GitHub state)
                 _restore_trust_cookie(context, log)
@@ -2071,9 +2907,8 @@ def _run_signup(
                 # Order the mailbox ONLY now that the form is ready — a Litensi
                 # order costs balance and expires in minutes, so never open it
                 # while DataDome may still burn time. Created once, reused
-                # across Tier-1 reloads and Tier-2 session switches.
-                # Provider errors (empty balance, bad key) propagate as-is so
-                # the caller aborts the job instead of failing every account.
+                # across Tier-1 reloads, Tier-2 session switches AND engine
+                # fallbacks.
                 pending["email"], pending["order_id"] = mail.create_mailbox()
                 log(f"[*] mailbox: {pending['email']} ({provider})")
             email = pending["email"]
@@ -2120,6 +2955,7 @@ def _run_signup(
                     msg = str(exc)
                     reloadable = (
                         "stayed disabled" in msg
+                        or "went blank" in msg.lower()
                         or "click" in msg.lower()
                         or "overlay" in msg.lower()
                         or "form" in msg.lower()
@@ -2139,6 +2975,7 @@ def _run_signup(
                 msg = str(exc)
                 reloadable = (
                     "stayed disabled" in msg
+                    or "went blank" in msg.lower()
                     or "click" in msg.lower()
                     or "overlay" in msg.lower()
                     or "form" in msg.lower()
@@ -2157,8 +2994,8 @@ def _run_signup(
             )
             # non-SignupError exceptions propagate immediately (with-block closes browser)
     raise SignupError(
-        f"signup form never completed after {page_reloads} page-reloads x "
-        f"{session_reloads + 1} sessions: {last_exc}"
+        f"signup form never completed on engine {engine_key} after "
+        f"{page_reloads} page-reloads x {session_reloads + 1} sessions: {last_exc}"
     )
 
 
@@ -2178,12 +3015,30 @@ def register_one(
             site=cfg.litensi_site,
             zone=cfg.litensi_zone,
         )
+    elif provider == "cloudflare":
+        from .cloudflare import CloudflareMailClient
+        mail = CloudflareMailClient(
+            domains=cfg.cloudflare_domains or [],
+            subdomains=cfg.cloudflare_subdomains or [""],
+            imap_host=cfg.imap_host,
+            imap_user=cfg.imap_user,
+            imap_pass=cfg.imap_pass,
+        )
+    elif provider == "tempik":
+        from .tempik import TempikMailClient
+        mail = TempikMailClient(
+            api_url=cfg.tempik_api,
+            domains=cfg.tempik_domains or [],
+        )
     else:
         mail = MailCxClient(domain=cfg.mailcx_domain)
     pending: dict = {}
 
     succeeded = False
     try:
+        # One exit IP for this account's whole life (signup -> verify -> login
+        # -> CodeBuddy). Rotation mid-cycle is what got fresh accounts suspended.
+        account_proxy_begin()
         password = generate_password()
         has_proxy = bool((cfg.proxy or "").strip() or (getattr(cfg, "proxy_file", "") or "").strip())
         hard_left = int(getattr(cfg, "proxy_hard_block_retries", 0) or 0) if has_proxy else 0
@@ -2211,6 +3066,18 @@ def register_one(
                     f"{rate_left} retries left")
                 _rotate_sticky_proxy()
                 _sleep_with_cancel(8, stop)
+            except SignupError as exc:
+                # The locked exit IP was the common factor across every engine
+                # (DataDome/network). Same account, DIFFERENT proxy — the lock
+                # exists to stop mid-cycle rotation, not to doom a bad pick.
+                if "all engines failed on network" not in str(exc) or hard_left <= 0:
+                    raise
+                hard_left -= 1
+                log(f"[!] every engine hit the network wall ({str(exc)[:120]}); "
+                    f"retrying with another proxy, {hard_left} left")
+                _disable_blocked_proxy(log)
+                _rotate_sticky_proxy()
+                _sleep_with_cancel(5, stop)
         # Recovery codes are stored in accounts/recovery/<email-hash>.txt.
         # This fifth marker lets the account UI show the recovery-code action
         # without exposing the codes in the main account list.
@@ -2227,6 +3094,11 @@ def register_one(
         # Stop was pressed while waiting for the verification email — this is
         # a clean cancellation, not a provider failure.
         raise RegistrationCancelled("cancelled while waiting for mail")
+    except MailboxAddressRejected as exc:
+        # GitHub refused the address itself: retrying cannot help, and it must
+        # not abort the batch — fail this account and move on.
+        log(f"[-] account failed: {exc}; continuing with the next account")
+        return None
     except MailboxTimeoutError as exc:
         # ONE mailbox never received the GitHub code in time. This is a
         # per-account transient failure — fail only this account and let the
@@ -2255,7 +3127,7 @@ def register_one(
             else:
                 _cancel_order(mail, order_id, log)
         elif provider != "litensi":
-            log("[*] mailbox cleanup: no action needed (mail.cx)")
+            log(f"[*] mailbox cleanup: no action needed ({provider})")
         # else: form never became ready — no order was ever placed, nothing to settle
 
 
@@ -2264,13 +3136,21 @@ def run_job(
     cancel_cb: Optional[Callable[[], bool]] = None,
     log: Optional[Callable[[str], None]] = None,
     progress_cb: Optional[Callable[[int, int], None]] = None,
+    overrides: Optional[dict] = None,
 ) -> tuple[int, int, Path]:
     """Register `register_count` accounts; returns (ok, fail, output_file).
 
     `progress_cb(ok, fail)` (optional) is invoked after each account attempt so
     external observers (e.g. the web UI) can render live stats instead of only
     seeing the final totals when the job returns.
+
+    `overrides` applies per-run fields (currently `headless`) on top of the
+    saved config, so a console toggle takes effect without rewriting config.json.
     """
+    if overrides:
+        for key, value in overrides.items():
+            if value is not None and hasattr(cfg, key):
+                setattr(cfg, key, value)
     if log is None:
         log = lambda msg: print(f"[{_now()}] {msg}")  # noqa: E731
     stop = cancel_cb or (lambda: False)
@@ -2288,7 +3168,9 @@ def run_job(
     out = ACCOUNTS_DIR / f"github_accounts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     ok = fail = 0
     provider = (getattr(cfg, "mail_provider", "mailcx") or "mailcx").strip().lower()
-    log(f"[*] github-regkit | engine=Camoufox (Firefox anti-detect) | mail_provider={provider} "
+    engine_note = getattr(cfg, "engine", "") or (
+        "auto:" + ",".join((getattr(cfg, "engine_order", None) or ["camoufox"])[:3]))
+    log(f"[*] github-regkit | engine={engine_note} | mail_provider={provider} "
         f"| headless={cfg.headless} | target={cfg.register_count} | output={out.name}")
     _emit_progress(ok, fail)  # initial snapshot: 0/0
     try:

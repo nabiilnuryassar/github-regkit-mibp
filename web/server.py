@@ -32,6 +32,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from github_register.config import Config, load_config
+from github_register import engines, proxy_probe
 from github_register.mailcx import MailCxClient
 from github_register.runner import load_proxy_pool, run_job, silence_playwright_noise
 
@@ -39,18 +40,9 @@ silence_playwright_noise()  # hide TargetClosedError spam when browsers close
 
 
 def _load_dotenv() -> None:
-    """Minimal .env loader (stdlib only): KEY=VALUE, # comments, quoted values."""
-    env_file = ROOT / ".env"
-    if not env_file.is_file():
-        return
-    for line in env_file.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, val = line.partition("=")
-        key, val = key.strip(), val.strip().strip("'\"")
-        if key and key not in os.environ:
-            os.environ[key] = val
+    """Load .env from the project root (shared loader, stdlib only)."""
+    from github_register.dotenv import load_dotenv
+    load_dotenv(ROOT / ".env")
 
 
 _load_dotenv()
@@ -77,7 +69,7 @@ if AUTH_ENABLED and HOST in ("0.0.0.0", "::"):
 
 DIST = ROOT / "frontend" / "dist"
 
-SECRET_FIELDS = {"proxy", "litensi_api_key"}
+SECRET_FIELDS = {"proxy", "litensi_api_key", "imap_pass"}
 
 
 def _migrate_legacy_account_files() -> None:
@@ -299,6 +291,10 @@ class AuthBody(BaseModel):
 
 class StartBody(BaseModel):
     count: int = Field(default=1, ge=1, le=1000)
+    # Per-run overrides: applied on top of config.json for this job only, so a
+    # console toggle takes effect without persisting it.
+    headless: Optional[bool] = None
+    engine: Optional[str] = None
 
 
 class ConfigBody(BaseModel):
@@ -308,6 +304,16 @@ class ConfigBody(BaseModel):
     litensi_api_key: Optional[str] = None
     litensi_site: Optional[str] = None
     litensi_zone: Optional[str] = None
+    cloudflare_domains: Optional[List[str]] = None
+    cloudflare_subdomains: Optional[List[str]] = None
+    imap_host: Optional[str] = None
+    imap_user: Optional[str] = None
+    imap_pass: Optional[str] = None
+    tempik_api: Optional[str] = None
+    tempik_domains: Optional[List[str]] = None
+    engine: Optional[str] = None
+    engine_order: Optional[List[str]] = None
+    engine_paths: Optional[Dict[str, str]] = None
     register_count: Optional[int] = None
     proxy: Optional[str] = None
     proxy_file: Optional[str] = None
@@ -336,7 +342,7 @@ def _save_config(cfg: Config) -> None:
     )
 
 
-def _run_job(count: int) -> None:
+def _run_job(count: int, overrides: Optional[dict] = None) -> None:
     global _controller
     controller = StopController()
     with _job_lock:
@@ -366,6 +372,7 @@ def _run_job(count: int) -> None:
             cancel_cb=controller.should_stop,
             log=_append_log,
             progress_cb=_on_progress,
+            overrides=overrides,
         )
         with _job_lock:
             _job_state.update(success=ok, fail=fail, accounts_file=str(out))
@@ -511,7 +518,60 @@ async def api_litensi_zones(
     return {"ok": True, "zones": zones, "site": site, "cheapest": cheapest}
 
 
+@app.get("/api/litensi/status")
+async def api_litensi_status(
+    x_access_key: Optional[str] = Header(None),
+) -> Dict[str, Any]:
+    """Read Litensi balance and zone stock using server-side credentials."""
+    _require_auth(x_access_key)
+    cfg = load_config(ROOT / "config.json")
+    if not cfg.litensi_api_id or not cfg.litensi_api_key or not cfg.litensi_site:
+        raise HTTPException(status_code=400, detail="Litensi credentials and site must be configured")
+    try:
+        from github_register.litensi import LitensiClient
+        status = LitensiClient(
+            api_id=cfg.litensi_api_id,
+            api_key=cfg.litensi_api_key,
+            site=cfg.litensi_site,
+            zone=cfg.litensi_zone,
+        ).dashboard_status()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Litensi check failed: {exc}")
+    return {"ok": True, **status}
+
+
+@app.get("/api/engines")
+async def api_engines(x_access_key: Optional[str] = Header(None)) -> Dict[str, Any]:
+    """Browser engine registry: labels, proxy rules and install status."""
+    _require_auth(x_access_key)
+    cfg = load_config(ROOT / "config.json")
+    return {"ok": True, "engines": engines.list_engines(cfg)}
+
+
 PROXY_SCHEMES = ("http", "https", "socks4", "socks5")
+
+
+@app.get("/api/cloudflare/check")
+async def api_cloudflare_check(
+    x_access_key: Optional[str] = Header(None)
+) -> Dict[str, Any]:
+    """Read-only Email Routing state for the configured Cloudflare domains."""
+    _require_auth(x_access_key)
+    token = (os.getenv("CLOUDFLARE_API_TOKEN") or "").strip()
+    cfg = load_config(ROOT / "config.json")
+    domains = [d for d in (cfg.cloudflare_domains or []) if d]
+    if not token:
+        return {"ok": True, "token_configured": False, "zones": [],
+                "detail": "set CLOUDFLARE_API_TOKEN in .env"}
+    if not domains:
+        return {"ok": True, "token_configured": True, "zones": [],
+                "detail": "cloudflare_domains is empty in config.json"}
+    try:
+        from github_register.cloudflare import list_zone_state
+        zones = list_zone_state(token, domains)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Cloudflare check failed: {exc}")
+    return {"ok": True, "token_configured": True, "zones": zones}
 
 
 def _valid_proxy_line(line: str) -> bool:
@@ -551,6 +611,67 @@ async def api_proxy_upload(
     return {"ok": True, "proxy_file": pool_name, "count": len(valid), "config": _public_config()}
 
 
+class ProxyTestBody(BaseModel):
+    """Reputation test options. `raw` probes pasted text instead of the pool."""
+    raw: Optional[str] = None
+    limit: int = Field(default=20, ge=1, le=200)
+    workers: int = Field(default=8, ge=1, le=24)
+
+
+@app.get("/api/proxy/pool")
+async def api_proxy_pool(x_access_key: Optional[str] = Header(None)) -> Dict[str, Any]:
+    """Pool overview. Ids carry the username only — never the password."""
+    _require_auth(x_access_key)
+    cfg = load_config(ROOT / "config.json")
+    name = (cfg.proxy_file or "").strip()
+    pool = load_proxy_pool(name) if name else []
+    items = []
+    for line in pool:
+        p = urlsplit(line)
+        items.append({"id": f"{p.username or ''}@{p.hostname}:{p.port or ''}",
+                      "scheme": (p.scheme or "http")})
+    return {"ok": True, "proxy_file": name, "count": len(pool), "proxies": items}
+
+
+@app.post("/api/proxy/test")
+async def api_proxy_test(
+    body: ProxyTestBody, x_access_key: Optional[str] = Header(None)
+) -> Dict[str, Any]:
+    """Measure pool reputation against GitHub without registering anything.
+
+    A proxy that connects but gets the DataDome stub is reported `blocked`:
+    it costs a full signup cycle in production, so it must not look healthy.
+    """
+    _require_auth(x_access_key)
+    if body.raw and body.raw.strip():
+        pool: List[str] = []
+        seen: set = set()
+        for line in body.raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or line in seen:
+                continue
+            if _valid_proxy_line(line):
+                seen.add(line)
+                pool.append(line)
+        if not pool:
+            raise HTTPException(status_code=400, detail="no valid proxies in the pasted text")
+    else:
+        cfg = load_config(ROOT / "config.json")
+        pool = load_proxy_pool(cfg.proxy_file) if cfg.proxy_file else []
+        if not pool:
+            raise HTTPException(status_code=400, detail="proxy pool is empty — upload or paste first")
+
+    _append_log(f"[*] proxy test: probing {min(body.limit, len(pool))} of {len(pool)} proxies")
+    results = await asyncio.to_thread(
+        proxy_probe.probe_pool, pool, body.workers, body.limit
+    )
+    summary = proxy_probe.summarize(results)
+    _append_log(f"[*] proxy test: {summary['usable']}/{summary['total']} usable "
+                f"({summary['blocked']} blocked, {summary['dead']} dead) — "
+                f"{'healthy' if summary['healthy'] else 'POOL NOT USABLE'}")
+    return {"ok": True, "summary": summary, "results": results}
+
+
 @app.get("/api/status")
 async def api_status(x_access_key: Optional[str] = Header(None)) -> Dict[str, Any]:
     _require_auth(x_access_key)
@@ -565,8 +686,12 @@ async def api_start(body: StartBody, x_access_key: Optional[str] = Header(None))
     with _job_lock:
         if _job_state["running"]:
             raise HTTPException(status_code=409, detail="job already running")
-        _append_log(f"[*] starting registration count={body.count}")
-        t = threading.Thread(target=_run_job, args=(body.count,), daemon=True)
+        overrides = {k: v for k, v in
+                     (("headless", body.headless), ("engine", body.engine))
+                     if v is not None}
+        _append_log(f"[*] starting registration count={body.count}"
+                    + (f" overrides={overrides}" if overrides else ""))
+        t = threading.Thread(target=_run_job, args=(body.count, overrides), daemon=True)
         _job_thread = t
         t.start()
     return {"ok": True, "started": True, "count": body.count}
@@ -582,6 +707,343 @@ async def api_stop(x_access_key: Optional[str] = Header(None)) -> Dict[str, Any]
         return {"ok": True, "stopped": False, "detail": "no running job"}
     ctrl.stop()
     _append_log("[!] stop requested from web")
+    return {"ok": True, "stopped": True}
+
+
+# ---------- CodeBuddy login module (separate feature) ----------
+
+_cb_lock = threading.Lock()
+_cb_thread: Optional[threading.Thread] = None
+_cb_stop_event = threading.Event()
+_cb_state: Dict[str, Any] = {"running": False, "started_at": "",
+                            "last_exit": None, "synced": 0, "total": 0,
+                            "source": "", "note": ""}
+
+
+class CodebuddyBody(BaseModel):
+    accounts: str = ""
+    limit: int = Field(default=0, ge=0, le=1000)
+    concurrency: int = Field(default=1, ge=1, le=10)
+    delay_ms: int = Field(default=15000, ge=0)
+    activate: bool = False
+    prove: bool = False
+
+
+def _run_codebuddy_job(opts: CodebuddyBody) -> None:
+    from github_register import codebuddy_flow as cf
+    with _cb_lock:
+        from datetime import datetime as _dt
+        _cb_state.update(running=True, started_at=_dt.now().strftime("%Y-%m-%d %H:%M:%S"),
+                         last_exit=None, synced=0, total=0, source=opts.accounts, note="")
+    try:
+        raw = opts.accounts or ""
+        if raw:
+            acc_path = Path(raw)
+            if not acc_path.is_absolute():
+                acc_path = ROOT / raw
+        else:
+            acc_path = cf.find_latest_accounts()
+        if acc_path is None or not acc_path.is_file():
+            _append_log("[!] codebuddy: accounts file tidak ditemukan")
+            return
+        accounts = cf.load_accounts(acc_path)
+        if opts.limit > 0:
+            accounts = accounts[: opts.limit]
+        if not accounts:
+            _append_log("[!] codebuddy: tidak ada akun valid di file itu")
+            return
+        with _cb_lock:
+            _cb_state["total"] = len(accounts)
+        _append_log(f"[*] codebuddy job: {len(accounts)} akun | file={acc_path.name} "
+                    f"| concurrency={opts.concurrency} | delayMs={opts.delay_ms} "
+                    f"| activate={opts.activate} | prove={opts.prove}")
+        proxies = cf.load_proxy_lines(None)
+        cf.write_codebuddy_input(accounts, cf.CB_DIR / "codebuddy.txt")
+        cf.write_codebuddy_config(proxies, accounts,
+                                  opts.concurrency, opts.delay_ms)
+        cf.ensure_node_deps(log=_append_log)
+        stop = _cb_stop_event.is_set
+        exit_code = cf.run_harvest(opts.concurrency, opts.delay_ms,
+                                   log=_append_log, stop=stop)
+        synced = cf.sync_results(accounts, log=_append_log)
+        if exit_code == 0 and opts.activate:
+            cf.run_stage("activate", accounts, log=_append_log, stop=stop)
+        if exit_code == 0 and opts.prove:
+            cf.run_stage("prove", accounts, log=_append_log, stop=stop)
+        with _cb_lock:
+            _cb_state.update(last_exit=exit_code, synced=synced)
+        _append_log(f"[*] codebuddy job selesai: exit={exit_code} synced={synced}")
+    except Exception as exc:  # noqa: BLE001 — job thread must never die silently
+        _append_log(f"[!] codebuddy job error: {exc}")
+    finally:
+        with _cb_lock:
+            _cb_state["running"] = False
+        _append_log("[*] codebuddy job thread finished")
+
+
+@app.get("/api/codebuddy/files")
+async def api_codebuddy_files(x_access_key: Optional[str] = Header(None)) -> Dict[str, Any]:
+    """Accounts files pickable by the CodeBuddy panel."""
+    _require_auth(x_access_key)
+    files = [{"name": p.name, "size": p.stat().st_size}
+             for p in sorted(ACCOUNTS_DIR.glob("github_accounts_*.txt"))]
+    return {"ok": True, "files": files}
+
+
+@app.post("/api/codebuddy/start")
+async def api_codebuddy_start(
+    body: CodebuddyBody, x_access_key: Optional[str] = Header(None)
+) -> Dict[str, Any]:
+    _require_auth(x_access_key)
+    global _cb_thread
+    with _cb_lock:
+        if _cb_state["running"]:
+            return {"ok": False, "detail": "codebuddy job sedang berjalan"}
+        _cb_stop_event.clear()
+        _cb_thread = threading.Thread(
+            target=_run_codebuddy_job, args=(body,), daemon=True)
+        _cb_thread.start()
+    _append_log("[*] codebuddy job dimulai dari web")
+    return {"ok": True, "started": True}
+
+
+@app.post("/api/codebuddy/stop")
+async def api_codebuddy_stop(x_access_key: Optional[str] = Header(None)) -> Dict[str, Any]:
+    _require_auth(x_access_key)
+    with _cb_lock:
+        running = _cb_state["running"]
+    if not running:
+        return {"ok": True, "stopped": False, "detail": "no running codebuddy job"}
+    _cb_stop_event.set()
+    _append_log("[!] codebuddy stop requested from web")
+    return {"ok": True, "stopped": True}
+
+
+@app.get("/api/codebuddy/status")
+async def api_codebuddy_status(x_access_key: Optional[str] = Header(None)) -> Dict[str, Any]:
+    _require_auth(x_access_key)
+    with _cb_lock:
+        return {"ok": True, **_cb_state}
+
+
+@app.get("/api/codebuddy/results")
+async def api_codebuddy_results(x_access_key: Optional[str] = Header(None)) -> Dict[str, Any]:
+    """Harvested folders under accounts/codebuddy/."""
+    _require_auth(x_access_key)
+    from github_register.codebuddy_flow import OUT_DIR
+    rows: List[Dict[str, Any]] = []
+    if OUT_DIR.is_dir():
+        for d in sorted(OUT_DIR.iterdir()):
+            if not d.is_dir():
+                continue
+            files = sorted(p.name for p in d.iterdir() if p.is_file())
+            rows.append({"email": d.name.replace("_", "@", 1),
+                         "has_tokens": (d / "cli_tokens.json").is_file(),
+                         "files": files})
+    return {"ok": True, "rows": rows, "total": len(rows)}
+
+
+@app.get("/api/codebuddy/tokens")
+def api_codebuddy_tokens(x_access_key: Optional[str] = Header(None)) -> Dict[str, Any]:
+    """Harvested token files — metadata only, never the token values."""
+    _require_auth(x_access_key)
+    from github_register import codebuddy_flow as cf
+    rows = cf.list_tokens()
+    return {"ok": True, "rows": rows, "total": len(rows)}
+
+
+@app.get("/api/codebuddy/export")
+def api_codebuddy_export(
+    kind: str = Query("access"), emails: str = Query(""),
+    x_access_key: Optional[str] = Header(None),
+) -> Dict[str, Any]:
+    """TXT payload of one token kind (`email----token` lines) for the browser to save."""
+    _require_auth(x_access_key)
+    from github_register import codebuddy_flow as cf
+    try:
+        filename, content = cf.export_tokens(kind, [e for e in emails.split(",") if e])
+    except ValueError as exc:
+        return {"ok": False, "detail": str(exc)}
+    return {"ok": True, "filename": filename, "content": content,
+            "count": content.count("\n")}
+
+
+@app.get("/api/codebuddy/quota")
+def api_codebuddy_quota(
+    email: str = Query(...), x_access_key: Optional[str] = Header(None)
+) -> Dict[str, Any]:
+    """Live credits for one account, read with its stored access token."""
+    _require_auth(x_access_key)
+    from github_register import codebuddy_flow as cf
+    row = next((r for r in cf.list_tokens() if r["email"].lower() == email.lower()), None)
+    if row is None:
+        return {"ok": False, "detail": "token tidak ditemukan untuk email itu"}
+    payload = cf.read_token_file(cf.OUT_DIR / row["file"])
+    token = payload.get("accessToken") or ""
+    if not token:
+        return {"ok": False, "detail": "accessToken kosong di file token"}
+    out = cf.fetch_quota(token)
+    _append_log(f"[*] codebuddy quota {email}: "
+                f"{'OK remain=' + str(out.get('total_remain')) if out.get('ok') else out.get('detail')}")
+    return out
+
+
+# ---------- Qoder registration + PAT injection module ----------
+
+_qoder_lock = threading.Lock()
+_qoder_thread: Optional[threading.Thread] = None
+_qoder_stop_event = threading.Event()
+_qoder_state: Dict[str, Any] = {"running": False, "started_at": "",
+                                "last_action": "", "count": 0, "injected": 0}
+
+
+class QoderStartBody(BaseModel):
+    count: int = Field(default=1, ge=1, le=100)
+
+
+def _run_qoder_job(count: int) -> None:
+    """Run Qoder registration in a background thread."""
+    from github_register import qoder_flow
+    from datetime import datetime as _dt
+    with _qoder_lock:
+        _qoder_state.update(running=True,
+                            started_at=_dt.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            last_action="register", count=count)
+    try:
+        cfg = load_config(ROOT / "config.json")
+        results = qoder_flow.run(cfg, count=count, log=_append_log)
+        with _qoder_lock:
+            _qoder_state["count"] = len(results)
+        _append_log(f"[*] qoder register done: {len(results)} accounts")
+    except Exception as exc:
+        _append_log(f"[!] qoder register error: {exc}")
+    finally:
+        with _qoder_lock:
+            _qoder_state["running"] = False
+        _append_log("[*] qoder job thread finished")
+
+
+def _run_qoder_inject() -> None:
+    """Run PAT injection in a background thread."""
+    from github_register import qoder_inject
+    from datetime import datetime as _dt
+    with _qoder_lock:
+        _qoder_state.update(running=True,
+                            started_at=_dt.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            last_action="inject", injected=0)
+    try:
+        pats = qoder_inject.load_pats(qoder_inject.PAT_FILE)
+        if not pats:
+            _append_log("[!] qoder inject: no PATs found")
+            return
+        _append_log(f"[*] qoder inject: {len(pats)} PAT(s)")
+        ok = 0
+        for i, entry in enumerate(pats, 1):
+            if _qoder_stop_event.is_set():
+                _append_log("[!] qoder inject stopped")
+                break
+            _append_log(f"[*] inject PAT {i}/{len(pats)}: {entry['pat'][:12]}...")
+            try:
+                r = qoder_inject.inject_pat(entry["pat"],
+                                            machine_id=entry.get("machine_id") or None,
+                                            log=_append_log)
+                if r.get("plan", {}).get("pro_claimed"):
+                    ok += 1
+                    _append_log(f"    ✓ PRO TRIAL ACTIVE")
+                else:
+                    _append_log(f"    ✗ not pro: {r.get('plan', {}).get('user_type')}")
+            except Exception as exc:
+                _append_log(f"    ✗ {exc}")
+            if i < len(pats):
+                time.sleep(3)
+        with _qoder_lock:
+            _qoder_state["injected"] = ok
+        _append_log(f"[*] qoder inject done: {ok}/{len(pats)} PRO")
+    except Exception as exc:
+        _append_log(f"[!] qoder inject error: {exc}")
+    finally:
+        with _qoder_lock:
+            _qoder_state["running"] = False
+        _append_log("[*] qoder inject thread finished")
+
+
+@app.get("/api/qoder/pats")
+async def api_qoder_pats(x_access_key: Optional[str] = Header(None)) -> Dict[str, Any]:
+    """List PATs from the PAT file."""
+    _require_auth(x_access_key)
+    from github_register.qoder_inject import load_pats, PAT_FILE
+    pats = load_pats(PAT_FILE)
+    rows = [{"pat_preview": p["pat"][:16] + "...",
+             "email": p.get("email", ""),
+             "machine_id": p.get("machine_id", ""),
+             "timestamp": p.get("timestamp", "")} for p in pats]
+    return {"ok": True, "pats": rows, "total": len(rows)}
+
+
+@app.get("/api/qoder/status")
+async def api_qoder_status(x_access_key: Optional[str] = Header(None)) -> Dict[str, Any]:
+    _require_auth(x_access_key)
+    with _qoder_lock:
+        return {"ok": True, **_qoder_state}
+
+
+@app.get("/api/qoder/results")
+async def api_qoder_results(x_access_key: Optional[str] = Header(None)) -> Dict[str, Any]:
+    """Last injection results from JSONL."""
+    _require_auth(x_access_key)
+    from github_register.qoder_inject import ROOT as _qr
+    results_file = _qr / "accounts" / "qoder_inject_results.jsonl"
+    rows = []
+    if results_file.is_file():
+        for line in results_file.read_text(encoding="utf-8").splitlines()[-50:]:
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                pass
+    return {"ok": True, "rows": rows, "total": len(rows)}
+
+
+@app.post("/api/qoder/start")
+async def api_qoder_start(
+    body: QoderStartBody, x_access_key: Optional[str] = Header(None)
+) -> Dict[str, Any]:
+    _require_auth(x_access_key)
+    global _qoder_thread
+    with _qoder_lock:
+        if _qoder_state["running"]:
+            return {"ok": False, "detail": "qoder job running"}
+        _qoder_stop_event.clear()
+        _qoder_thread = threading.Thread(
+            target=_run_qoder_job, args=(body.count,), daemon=True)
+        _qoder_thread.start()
+    _append_log("[*] qoder register started from web")
+    return {"ok": True, "started": True}
+
+
+@app.post("/api/qoder/inject")
+async def api_qoder_inject(x_access_key: Optional[str] = Header(None)) -> Dict[str, Any]:
+    _require_auth(x_access_key)
+    global _qoder_thread
+    with _qoder_lock:
+        if _qoder_state["running"]:
+            return {"ok": False, "detail": "qoder job running"}
+        _qoder_stop_event.clear()
+        _qoder_thread = threading.Thread(
+            target=_run_qoder_inject, daemon=True)
+        _qoder_thread.start()
+    _append_log("[*] qoder inject started from web")
+    return {"ok": True, "started": True}
+
+
+@app.post("/api/qoder/stop")
+async def api_qoder_stop(x_access_key: Optional[str] = Header(None)) -> Dict[str, Any]:
+    _require_auth(x_access_key)
+    with _qoder_lock:
+        running = _qoder_state["running"]
+    if not running:
+        return {"ok": True, "stopped": False}
+    _qoder_stop_event.set()
+    _append_log("[!] qoder stop requested")
     return {"ok": True, "stopped": True}
 
 

@@ -4,3 +4,12 @@ requests>=2.32
 fastapi>=0.141
 uvicorn[standard]>=0.52
 pyotp>=2.9
+
+# Multi-engine fallback (see README "Browser engines"): pip-installable engines.
+patchright>=1.64
+cloakbrowser>=0.7
+# Optional, heavy external setups — install on demand:
+#   Damru ................ pip install git+https://github.com/akwin1234/damru.git (Linux + Docker)
+#   Clawbrowser .......... clawctl CLI + API key  (https://github.com/clawbrowser/clawbrowser)
+#   AliasMode ............ desktop app + Local API (https://github.com/aliasmode/aliasmode)
+#   Fingerprint Chromium . binary from https://github.com/adryfish/fingerprint-chromium/releases

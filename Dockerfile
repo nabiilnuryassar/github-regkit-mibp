@@ -29,6 +29,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Wajib sukses: unduh browser Camoufox sekali saat build (bukan tiap start).
 RUN python -m camoufox fetch
+# Patchright (Chromium) — engine fallback kedua; unduh sekali saat build.
+RUN patchright install chromium
 
 COPY github_register/ ./github_register/
 COPY web/ ./web/

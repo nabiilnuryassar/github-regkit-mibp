@@ -13,12 +13,17 @@ import {
   Plus,
   Settings,
   ShieldCheck,
+  KeyRound,
+  Zap,
   X,
 } from "lucide-react";
 import { api, getToken, setToken } from "./api.js";
 import StatusPanel from "./components/StatusPanel.jsx";
 import ConfigPanel from "./components/ConfigPanel.jsx";
 import AccountsPanel from "./components/AccountsPanel.jsx";
+import CodeBuddyPanel from "./components/CodeBuddyPanel.jsx";
+import QoderPanel from "./components/QoderPanel.jsx";
+import ProxiesPanel from "./components/ProxiesPanel.jsx";
 import {
   Badge,
   Button,
@@ -32,6 +37,9 @@ const NAV = [
   { id: "status", label: "Status", icon: Activity },
   { id: "config", label: "Config", icon: Settings },
   { id: "accounts", label: "Accounts", icon: Boxes },
+  { id: "proxies", label: "Proxies", icon: ShieldCheck },
+  { id: "codebuddy", label: "CodeBuddy", icon: KeyRound },
+  { id: "qoder", label: "Qoder", icon: Zap },
 ];
 
 export default function App() {
@@ -192,6 +200,9 @@ export default function App() {
     status: StatusPanel,
     config: ConfigPanel,
     accounts: AccountsPanel,
+    proxies: ProxiesPanel,
+    codebuddy: CodeBuddyPanel,
+    qoder: QoderPanel,
   }[tab];
   return (
     <div

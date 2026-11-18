@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Search, Save, Mail, Shield, X, RefreshCw } from "lucide-react";
+import { Search, Save, Mail, Shield, X, RefreshCw, Check, Cloud, Boxes } from "lucide-react";
 import { api } from "../api.js";
 import { Button, Card, Input, Spinner } from "./ui.jsx";
 
@@ -33,6 +33,51 @@ const LITENSI_FIELDS = [
     label: "Zone (blank = auto cheapest)",
     group: "Mail Provider",
     hasZoneChecker: true,
+    wide: true,
+  },
+];
+
+const CLOUDFLARE_FIELDS = [
+  {
+    key: "cloudflare_domains",
+    label: "Email Routing domains (comma separated)",
+    group: "Mail Provider",
+    isList: true,
+    wide: true,
+  },
+  {
+    key: "cloudflare_subdomains",
+    label: "Rotating subdomains (comma separated)",
+    group: "Mail Provider",
+    isList: true,
+  },
+  { key: "imap_host", label: "IMAP host", group: "Mail Provider" },
+  {
+    key: "imap_user",
+    label: "IMAP user (Gmail destination)",
+    group: "Mail Provider",
+  },
+  {
+    key: "imap_pass",
+    label: "IMAP App Password",
+    secret: true,
+    group: "Mail Provider",
+    wide: true,
+  },
+];
+
+const TEMPIK_FIELDS = [
+  {
+    key: "tempik_api",
+    label: "Tempik API URL (Cloudflare Worker)",
+    group: "Mail Provider",
+    wide: true,
+  },
+  {
+    key: "tempik_domains",
+    label: "Domains (comma separated; blank = auto from worker)",
+    group: "Mail Provider",
+    isList: true,
     wide: true,
   },
 ];
@@ -185,6 +230,8 @@ export default function ConfigPanel() {
   // mailcx domains
   const [mailcxDomains, setMailcxDomains] = useState([]);
 
+  // browser engine registry (install status + hints)
+  const [engines, setEngines] = useState([]);
   useEffect(() => {
     api
       .get("/api/config")
@@ -200,6 +247,14 @@ export default function ConfigPanel() {
     api
       .post("/api/mailcx/domains", {})
       .then((d) => setMailcxDomains(d.domains || []))
+      .catch(() => {});
+  }, []);
+
+  // fetch browser engine registry on mount
+  useEffect(() => {
+    api
+      .get("/api/engines")
+      .then((d) => setEngines(d.engines || []))
       .catch(() => {});
   }, []);
 
@@ -234,6 +289,15 @@ export default function ConfigPanel() {
         litensi_api_key: cfg.litensi_api_key ?? "",
         litensi_site: cfg.litensi_site ?? "",
         litensi_zone: cfg.litensi_zone ?? "",
+        cloudflare_domains: cfg.cloudflare_domains ?? [],
+        cloudflare_subdomains: cfg.cloudflare_subdomains ?? [],
+        imap_host: cfg.imap_host ?? "",
+        imap_user: cfg.imap_user ?? "",
+        imap_pass: cfg.imap_pass ?? "",
+        tempik_api: cfg.tempik_api ?? "",
+        tempik_domains: cfg.tempik_domains ?? [],
+        engine: cfg.engine ?? "",
+        engine_order: cfg.engine_order ?? [],
         proxy_file: cfg.proxy_file ?? "",
       };
       // collect fields from each group
@@ -258,14 +322,10 @@ export default function ConfigPanel() {
     setZoneError("");
     setZoneData(null);
     try {
-      const d = await api.post("/api/litensi/zones", {
-        litensi_api_id: String(cfg.litensi_api_id ?? ""),
-        litensi_api_key: String(cfg.litensi_api_key ?? ""),
-        litensi_site: String(cfg.litensi_site ?? ""),
-      });
-      setZoneData(d);
+      const d = await api.get("/api/litensi/status");
+      setZoneData({ ...d, checkedAt: new Date().toISOString() });
     } catch (e) {
-      setZoneError(e.message || "Unable to retrieve zone list");
+      setZoneError(e.message || "Unable to check Litensi");
     } finally {
       setZoneLoading(false);
     }
@@ -287,6 +347,57 @@ export default function ConfigPanel() {
     <div style={styles.wrap} className="config-layout">
       <div style={styles.columns} className="cfg-columns">
         <div style={styles.col}>
+          {/* ── Browser Engine card ── */}
+          <Card style={styles.card}>
+            <div style={styles.groupTitle}>Browser Engine</div>
+            <p style={styles.engineDesc}>
+              Which engine carries a run. The choice is exclusive. Nothing
+              selected keeps the automatic order — the next engine takes over
+              when one fails. Clawbrowser rides the managed proxy and is never
+              handed your custom proxy; the others ride your custom proxy and
+              never read or spend a pool key.
+            </p>
+            <div style={styles.engineGrid}>
+              <EngineOption
+                label="Automatic"
+                sub={`Order: ${(cfg.engine_order || []).join(", ") || "default"}`}
+                active={!cfg.engine}
+                hint="Nothing selected keeps engine_order — a failing engine falls back to the next."
+                onClick={() => set("engine", "")}
+              />
+              {engines.map((e) => (
+                <EngineOption
+                  key={e.key}
+                  label={`${e.label} (${e.short})`}
+                  sub={e.description}
+                  active={cfg.engine === e.key}
+                  available={e.available}
+                  hint={e.hint}
+                  onClick={() => set("engine", e.key)}
+                />
+              ))}
+            </div>
+            <label style={styles.field}>
+              <span style={styles.label}>
+                Fallback order (engine keys, comma separated)
+              </span>
+              <Input
+                type="text"
+                value={(cfg.engine_order || []).join(", ")}
+                onChange={(e) =>
+                  set(
+                    "engine_order",
+                    e.target.value
+                      .split(",")
+                      .map((s) => s.trim())
+                      .filter(Boolean)
+                  )
+                }
+                placeholder="camoufox, patchright, cloakbrowser"
+              />
+            </label>
+          </Card>
+
           {/* ── Mail Provider card ── */}
           <Card style={styles.card}>
             <div style={styles.groupTitle}>Mail Provider</div>
@@ -343,26 +454,64 @@ export default function ConfigPanel() {
                   Litensi <span style={styles.badgePaid}>Paid</span>
                 </span>
               </label>
+              <label style={styles.radioLabel}>
+                <input
+                  type="radio"
+                  name="mail_provider"
+                  value="cloudflare"
+                  checked={provider === "cloudflare"}
+                  onChange={() => set("mail_provider", "cloudflare")}
+                  style={styles.radio}
+                />
+                <Cloud
+                  size={16}
+                  style={{
+                    color:
+                      provider === "cloudflare" ? "var(--accent)" : "var(--muted)",
+                  }}
+                />
+                <span
+                  style={{
+                    color:
+                      provider === "cloudflare" ? "var(--text)" : "var(--muted)",
+                  }}
+                >
+                  Cloudflare Email Routing{" "}
+                  <span style={styles.badgePaid}>Domain sendiri</span>
+                </span>
+              </label>
+
+              <label style={styles.radioLabel}>
+                <input
+                  type="radio"
+                  name="mail_provider"
+                  value="tempik"
+                  checked={provider === "tempik"}
+                  onChange={() => set("mail_provider", "tempik")}
+                  style={styles.radio}
+                />
+                <Boxes
+                  size={16}
+                  style={{
+                    color:
+                      provider === "tempik" ? "var(--accent)" : "var(--muted)",
+                  }}
+                />
+                <span
+                  style={{
+                    color:
+                      provider === "tempik" ? "var(--text)" : "var(--muted)",
+                  }}
+                >
+                  Tempik{" "}
+                  <span style={styles.badgePaid}>Worker sendiri</span>
+                </span>
+              </label>
             </div>
 
             {/* provider-specific fields */}
             <div style={styles.fieldsGrid} className="cfg-fields">
-              {provider === "litensi" ? (
-                LITENSI_FIELDS.map((f) => (
-                  <div
-                    key={f.key}
-                    style={f.wide ? styles.fieldWide : styles.fieldHalf}
-                    className={f.wide ? "cfg-field-wide" : "cfg-field-half"}
-                  >
-                    <Field
-                      f={f}
-                      value={cfg[f.key]}
-                      onChange={(v) => set(f.key, v)}
-                      onCheckZones={f.hasZoneChecker ? checkZones : null}
-                    />
-                  </div>
-                ))
-              ) : (
+              {provider === "mailcx" ? (
                 <>
                   <div style={styles.fieldWide} className="cfg-field-wide">
                     <label style={styles.field}>
@@ -382,6 +531,28 @@ export default function ConfigPanel() {
                     </label>
                   </div>
                 </>
+              ) : (
+                (provider === "litensi"
+                  ? LITENSI_FIELDS
+                  : provider === "tempik"
+                    ? TEMPIK_FIELDS
+                    : CLOUDFLARE_FIELDS
+                ).map(
+                  (f) => (
+                    <div
+                      key={f.key}
+                      style={f.wide ? styles.fieldWide : styles.fieldHalf}
+                      className={f.wide ? "cfg-field-wide" : "cfg-field-half"}
+                    >
+                      <Field
+                        f={f}
+                        value={cfg[f.key]}
+                        onChange={(v) => set(f.key, v)}
+                        onCheckZones={f.hasZoneChecker ? checkZones : null}
+                      />
+                    </div>
+                  )
+                )
               )}
             </div>
 
@@ -442,6 +613,29 @@ export default function ConfigPanel() {
 }
 
 /* ───────────────────── sub-components ───────────────────── */
+
+function EngineOption({ label, sub, active, available = true, hint = "", onClick }) {
+  return (
+    <button
+      type="button"
+      className={active ? "engine-card active" : "engine-card"}
+      onClick={onClick}
+      title={available ? hint : `Not installed — ${hint}`}
+      style={{
+        ...styles.engineCard,
+        ...(active ? styles.engineCardActive : {}),
+        ...(available ? {} : styles.engineCardOff),
+      }}
+    >
+      <span style={styles.engineCardHead}>
+        <span style={styles.engineName}>{label}</span>
+        <span style={styles.engineDot}>{active && <Check size={13} />}</span>
+      </span>
+      <span style={styles.engineSub}>{sub}</span>
+      {!available && <span style={styles.engineOff}>not installed</span>}
+    </button>
+  );
+}
 
 function GroupCard({ name, fields, cfg, set }) {
   return (
@@ -604,18 +798,31 @@ function Field({ f, value, onChange, onCheckZones }) {
       <span style={styles.label}>{f.label}</span>
       <div style={styles.inputRow}>
         <Input
-          type={f.type === "number" ? "number" : "text"}
-          value={value ?? ""}
-          onChange={(e) => onChange(e.target.value)}
+          type={f.secret ? "password" : f.type === "number" ? "number" : "text"}
+          value={
+            f.isList
+              ? (Array.isArray(value) ? value.join(", ") : (value ?? ""))
+              : (value ?? "")
+          }
+          onChange={(e) =>
+            onChange(
+              f.isList
+                ? e.target.value
+                    .split(",")
+                    .map((s) => s.trim())
+                    .filter(Boolean)
+                : e.target.value
+            )
+          }
           style={{ flex: 1, minWidth: 0 }}
         />
         {onCheckZones && (
           <Button
             type="button"
             onClick={onCheckZones}
-            title="Retrieve Litensi zones"
+            title="Check Litensi connection, balance, and zone stock"
           >
-            <Search size={15} /> Zones
+            <Search size={15} /> Check API
           </Button>
         )}
       </div>
@@ -653,15 +860,14 @@ function ZoneModal({
       >
         <div style={styles.modalHead}>
           <div>
-            <div style={styles.modalTitle}>Litensi Zones</div>
-            <div style={styles.modalSub}>
+            <div style={styles.modalTitle}>Litensi status &amp; zones</div>
+            <div className={styles.modalSub}>
               {data?.site ? (
-                <>
-                  Site: <b style={{ color: "var(--text)" }}>{data.site}</b>
-                </>
+                <>Site: <b style={{ color: "var(--text)" }}>{data.site}</b></>
               ) : (
-                "Available zones"
+                "Uses saved Litensi settings"
               )}
+              <div>Read-only check. Credentials remain on the server.</div>
             </div>
           </div>
           <button
@@ -675,7 +881,24 @@ function ZoneModal({
         </div>
 
         <div style={styles.modalBody}>
-          {loading && <div style={styles.center}>Loading zones...</div>}
+          {loading && (
+            <div className={styles.center} role="status">
+              Checking Litensi connection, balance, and zone stock...
+            </div>
+          )}
+          {!loading && !error && data && (
+            <section aria-live="polite" style={styles.apiStatus}>
+              <strong>Litensi API reachable</strong>
+              <div>
+                Balance: <b>{formatBalance(data.balance)}</b>
+                {" · "}
+                In-stock zones: <b>{data.available_zones}</b> / {allZones.length}
+              </div>
+              <small>
+                Checked {new Date(data.checkedAt).toLocaleString()}
+              </small>
+            </section>
+          )}
           {!loading && error && (
             <div style={styles.errorBox}>
               <div
@@ -859,9 +1082,65 @@ function formatPrice(n) {
   }
 }
 
+function formatBalance(value) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return "Unavailable";
+  return new Intl.NumberFormat("id-ID", {
+    style: "currency",
+    currency: "IDR",
+    maximumFractionDigits: 2,
+  }).format(amount);
+}
+
 /* ───────────────────── styles ───────────────────── */
 
 const styles = {
+  // engine selector grid (mirrors the "Browser Engine" panel)
+  engineDesc: { fontSize: 12.5, color: "var(--muted)", lineHeight: 1.55, margin: "0 0 14px" },
+  engineGrid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fill, minmax(168px, 1fr))",
+    gap: 8,
+    marginBottom: 16,
+  },
+  engineCard: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 6,
+    alignItems: "flex-start",
+    textAlign: "left",
+    padding: "12px 14px",
+    borderRadius: 10,
+    border: "1px solid var(--border)",
+    background: "var(--bg-input)",
+    color: "var(--text)",
+    font: "inherit",
+    fontSize: 12.5,
+    cursor: "pointer",
+    minHeight: 78,
+  },
+  engineCardActive: { borderColor: "var(--accent)", boxShadow: "0 0 0 1px var(--accent)" },
+  engineCardOff: { opacity: 0.55 },
+  engineCardHead: { display: "flex", justifyContent: "space-between", width: "100%", gap: 8 },
+  engineName: { fontWeight: 700, color: "var(--text)" },
+  engineDot: {
+    width: 18,
+    height: 18,
+    flex: "none",
+    display: "grid",
+    placeItems: "center",
+    borderRadius: "50%",
+    border: "1px solid var(--border)",
+    color: "var(--accent-text)",
+  },
+  engineSub: { fontSize: 11.5, color: "var(--muted)", lineHeight: 1.4 },
+  engineOff: {
+    fontSize: 10,
+    fontWeight: 600,
+    textTransform: "uppercase",
+    letterSpacing: 0.6,
+    color: "var(--danger)",
+  },
   wrap: {
     display: "flex",
     flexDirection: "column",
@@ -1009,6 +1288,15 @@ const styles = {
     padding: "32px 12px",
     color: "var(--muted)",
     fontSize: 13.5,
+  },
+  apiStatus: {
+    display: "grid",
+    gap: 5,
+    marginBottom: 14,
+    padding: "12px 14px",
+    border: "1px solid var(--border)",
+    borderRadius: 8,
+    fontSize: 13,
   },
   errorBox: {
     padding: "14px 16px",

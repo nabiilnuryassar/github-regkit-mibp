@@ -88,6 +88,22 @@ class LitensiClient:
         )
         return data if isinstance(data, list) else []
 
+    def dashboard_status(self) -> dict:
+        """Return read-only profile balance and mail-zone availability."""
+        profile = self.profile()
+        zones = self.prices()
+        available = [z for z in zones if float(z.get("stock") or 0) > 0]
+        return {
+            "balance": profile.get("balance"),
+            "site": self.site,
+            "zones": zones,
+            "available_zones": len(available),
+            "cheapest": (
+                min(available, key=lambda z: float(z.get("price") or 0))["zone"]
+                if available else ""
+            ),
+        }
+
     def pick_zone(self) -> str:
         stock = [z for z in self.prices() if float(z.get("stock") or 0) > 0]
         if not stock:
